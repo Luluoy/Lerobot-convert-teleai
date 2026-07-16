@@ -145,26 +145,43 @@ async function inspectSource() {
 }
 
 function renderDescriptor(descriptor) {
+  const fields = descriptorFields(descriptor);
+  const imageCount = fields.filter((field) => field.is_image).length;
   const readout = $("#datasetReadout");
   readout.hidden = false;
   readout.innerHTML = `<dl>
     <dt>EPISODES</dt><dd>${descriptor.episodes.length}</dd>
     <dt>FRAMES</dt><dd>${formatInteger(descriptor.total_frames)}</dd>
     <dt>CAMERAS</dt><dd>${descriptor.cameras.length}</dd>
+    <dt>FIELDS / IMG</dt><dd>${fields.length} / ${imageCount}</dd>
     <dt>STATE / ACTION</dt><dd>${descriptor.state_dim} / ${descriptor.action_dim}</dd>
     <dt>SOURCE</dt><dd>${formatBytes(descriptor.source_bytes)}</dd>
     <dt>WORKER EST.</dt><dd>${formatInteger(descriptor.estimated_worker_memory_mb)} MiB</dd>
   </dl>${descriptor.warnings.length ? `<p>${escapeHtml(descriptor.warnings[0])}</p>` : ""}`;
 
-  const mapping = $("#cameraMapping");
+  const mapping = $("#fieldMapping");
+  const targetSuggestions = [...new Set([
+    "observation.state",
+    "action",
+    "observation.velocity",
+    "observation.effort",
+    "observation.eef_pose",
+    ...fields.map((field) => field.default_target).filter(Boolean),
+  ])];
   mapping.hidden = false;
-  mapping.innerHTML = `<span class="field-label">Camera output names</span>${descriptor.cameras.map((camera) => `
-    <div class="camera-row"><label title="${escapeHtml(camera)}">${escapeHtml(camera)}</label>
-    <input data-camera-name="${escapeHtml(camera)}" value="${escapeHtml(defaultCameraName(camera))}" aria-label="${escapeHtml(camera)} 输出名称"></div>`).join("")}
-    <label class="field-label" for="stateNames">State names</label>
+  mapping.innerHTML = `<span class="field-label">Field mapping</span>
+    <datalist id="lerobotFieldTargets">${targetSuggestions.map((target) => `<option value="${escapeHtml(target)}"></option>`).join("")}</datalist>
+    <div class="field-map-head"><span>RAW FIELD</span><span></span><span>LEROBOT FIELD</span></div>
+    ${fields.map((field) => `<div class="field-map-row">
+      <div class="field-source" title="${escapeHtml(field.name)}"><strong>${escapeHtml(field.name)}</strong><span>${field.is_image ? "IMG" : field.dtype.toUpperCase()} / ${(field.shape || []).join("x")}</span></div>
+      <i data-lucide="arrow-right"></i>
+      <input type="text" data-field-source="${escapeHtml(field.name)}" list="lerobotFieldTargets" value="${escapeHtml(field.default_target || "")}" placeholder="IGNORE" aria-label="${escapeHtml(field.name)} LeRobot 目标字段">
+    </div>`).join("")}
+    <label class="field-label" for="stateNames">observation.state names override</label>
     <textarea id="stateNames" rows="2" placeholder="state_0, state_1, ..."></textarea>
-    <label class="field-label" for="actionNames">Action names</label>
+    <label class="field-label" for="actionNames">action names override</label>
     <textarea id="actionNames" rows="2" placeholder="action_0, action_1, ..."></textarea>`;
+  window.lucide?.createIcons();
 }
 
 async function createJob(event) {
@@ -173,8 +190,11 @@ async function createJob(event) {
   const button = $("#createJobButton");
   button.disabled = true;
   try {
-    const cameraNames = {};
-    $$('[data-camera-name]').forEach((input) => { cameraNames[input.dataset.cameraName] = input.value; });
+    const fieldMapping = {};
+    $$('[data-field-source]').forEach((input) => {
+      const target = input.value.trim();
+      if (target) fieldMapping[input.dataset.fieldSource] = target;
+    });
     const payload = {
       adapter: $("#adapterSelect").value,
       source_path: $("#sourcePath").value,
@@ -187,7 +207,7 @@ async function createJob(event) {
       cpu_cores: Number($("#cpuCores").value),
       memory_gb: Number($("#memoryGb").value),
       segment_size: Number($("#segmentSize").value),
-      camera_names: cameraNames,
+      field_mapping: fieldMapping,
       state_names: splitNames($("#stateNames")?.value),
       action_names: splitNames($("#actionNames")?.value),
       adapter_options: adapterOptions(),
@@ -321,11 +341,14 @@ function renderDetail(job) {
 }
 
 function configurePreview(descriptor, job) {
-  $("#previewBand").hidden = false;
   const camera = $("#previewCamera");
   const previous = camera.value;
-  camera.replaceChildren(...descriptor.cameras.map((name) => new Option(name, name)));
-  if (descriptor.cameras.includes(previous)) camera.value = previous;
+  let cameras = descriptorFields(descriptor).filter((field) => field.is_image).map((field) => field.name);
+  if (job?.config?.field_mapping) cameras = cameras.filter((name) => job.config.field_mapping[name]);
+  $("#previewBand").hidden = cameras.length === 0;
+  camera.replaceChildren(...cameras.map((name) => new Option(name, name)));
+  if (!cameras.length) return;
+  if (cameras.includes(previous)) camera.value = previous;
   const episode = $("#episodeSlider");
   episode.max = Math.max(0, descriptor.episodes.length - 1);
   episode.value = Math.min(Number(episode.value), Number(episode.max));
@@ -354,6 +377,7 @@ function schedulePreview() {
 async function loadPreview(only = "both") {
   const descriptor = state.previewDescriptor;
   if (!descriptor?.episodes.length) return;
+  if (!$("#previewCamera").options.length) return;
   updateTimelineOutputs();
   const episode = Number($("#episodeSlider").value);
   const frame = Number($("#frameSlider").value);
@@ -488,6 +512,20 @@ function restorePreferences() {
 
 function selectedJob() { return state.jobs.find((job) => job.id === state.selectedJobId); }
 function splitNames(value = "") { return value.split(/[,\n]/).map((item) => item.trim()).filter(Boolean); }
+function descriptorFields(descriptor) {
+  if (descriptor?.fields?.length) return descriptor.fields;
+  return [
+    { name: "state", shape: [descriptor.state_dim], dtype: "float32", is_image: false, default_target: "observation.state" },
+    { name: "action", shape: [descriptor.action_dim], dtype: "float32", is_image: false, default_target: "action" },
+    ...descriptor.cameras.map((camera) => ({
+      name: camera,
+      shape: descriptor.camera_shapes[camera],
+      dtype: "uint8",
+      is_image: true,
+      default_target: `observation.images.${defaultCameraName(camera)}`,
+    })),
+  ];
+}
 function basename(path) { return path?.replace(/\/+$/, "").split("/").pop() || ""; }
 function defaultCameraName(camera) { const match = camera.match(/(\d+)$/); return match ? `image_${match[1]}` : camera.replace(/[^a-zA-Z0-9_]+/g, "_").toLowerCase(); }
 function camelId(value) { return value.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase()); }

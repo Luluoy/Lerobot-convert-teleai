@@ -29,6 +29,8 @@ from .models import DatasetDescriptor, JobConfig
 
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 ACTIVE_STATES = {"queued", "running", "merging", "stopping"}
+RESERVED_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
+FEATURE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*$")
 
 
 class JobStore:
@@ -289,6 +291,7 @@ class JobManager:
         }
         if len(set(camera_names.values())) != len(camera_names):
             raise ValueError("Camera output names must be unique")
+        field_mapping = _normalize_field_mapping(payload, descriptor, camera_names)
         task_instruction = str(payload.get("task_instruction") or "").strip()
         if not task_instruction:
             raise ValueError("Task instruction is required")
@@ -310,6 +313,7 @@ class JobManager:
             camera_names=camera_names,
             state_names=state_names,
             action_names=action_names,
+            field_mapping=field_mapping,
             adapter_options={**adapter_options, "fps": max(1, int(payload.get("fps") or descriptor.fps))},
             skip_zero_state=bool(payload.get("skip_zero_state", True)),
             overwrite=bool(payload.get("overwrite", False)),
@@ -852,6 +856,46 @@ def _safe_name(value: str) -> str:
 def _default_camera_name(camera: str) -> str:
     match = re.search(r"(\d+)$", camera)
     return f"image_{match.group(1)}" if match else camera
+
+
+def _normalize_field_mapping(
+    payload: dict[str, Any], descriptor: DatasetDescriptor, camera_names: dict[str, str]
+) -> dict[str, str]:
+    fields = {field.name: field for field in descriptor.resolved_fields()}
+    requested = payload.get("field_mapping") if "field_mapping" in payload else None
+    if requested is not None and not isinstance(requested, dict):
+        raise TypeError("field_mapping must be an object")
+    unknown = set(requested or {}) - set(fields)
+    if unknown:
+        raise ValueError(f"Unknown raw fields: {', '.join(sorted(unknown))}")
+
+    mapping: dict[str, str] = {}
+    for name, field in fields.items():
+        if requested is None:
+            target = field.default_target
+            if field.is_image and name in camera_names and payload.get("camera_names") is not None:
+                target = f"observation.images.{camera_names[name]}"
+        else:
+            target = requested.get(name, "")
+        target = str(target or "").strip()
+        if not target:
+            continue
+        if target in RESERVED_FEATURES:
+            raise ValueError(f"LeRobot field is reserved: {target}")
+        if FEATURE_NAME_RE.fullmatch(target) is None or "/" in target:
+            raise ValueError(f"Invalid LeRobot field name: {target!r}")
+        if field.is_image and target in {"observation.state", "action"}:
+            raise ValueError(f"Image field {name} cannot map to {target}")
+        if not field.is_image and target.startswith("observation.images."):
+            raise ValueError(f"Numeric field {name} cannot map to an image target")
+        mapping[name] = target
+
+    targets = list(mapping.values())
+    if not targets:
+        raise ValueError("At least one raw field must be mapped")
+    if len(set(targets)) != len(targets):
+        raise ValueError("LeRobot target fields must be unique")
+    return mapping
 
 
 def _safe_repo_id(value: str) -> str:

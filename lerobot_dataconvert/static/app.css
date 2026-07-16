@@ -191,10 +191,15 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
 .segmented input { position: absolute; opacity: 0; pointer-events: none; }
 .segmented label:has(input:checked) { color: var(--signal-ink); background: var(--signal); font-weight: 800; }
 
-.camera-mapping { margin-top: 14px; border-top: 1px solid var(--line); }
-.camera-row { display: grid; grid-template-columns: 95px minmax(0, 1fr); align-items: center; gap: 8px; padding-top: 8px; }
-.camera-row label { min-width: 0; overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
-.camera-row input { min-height: 34px; padding-block: 6px; }
+.field-mapping { margin-top: 14px; border-top: 1px solid var(--line); }
+.field-map-head, .field-map-row { display: grid; grid-template-columns: minmax(0, .72fr) 14px minmax(0, 1.28fr); gap: 4px; align-items: center; }
+.field-map-head { min-height: 26px; color: var(--muted); font-size: 8px; }
+.field-map-row { min-height: 50px; border-top: 1px solid var(--line); }
+.field-map-row > svg { width: 13px; color: var(--line-strong); }
+.field-map-row input { min-width: 0; min-height: 34px; padding-block: 6px; font-size: 9px; }
+.field-source { min-width: 0; }
+.field-source strong { display: block; overflow-wrap: anywhere; color: var(--text); font-size: 9px; font-weight: 500; }
+.field-source span { display: block; margin-top: 2px; color: var(--signal); font-size: 8px; }
 
 .range-field { margin-top: 13px; }
 .range-field > div { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }

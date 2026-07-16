@@ -33,33 +33,52 @@ def revision_catalog() -> list[dict[str, str]]:
 
 
 def camera_feature_map(config: JobConfig, descriptor: DatasetDescriptor) -> dict[str, str]:
+    fields = {field.name: field for field in descriptor.resolved_fields()}
     return {
-        camera: f"observation.images.{config.camera_names.get(camera, camera)}"
-        for camera in descriptor.cameras
+        source: target
+        for source, target in resolved_field_mapping(config, descriptor).items()
+        if fields[source].is_image
     }
+
+
+def resolved_field_mapping(config: JobConfig, descriptor: DatasetDescriptor) -> dict[str, str]:
+    if config.field_mapping:
+        return dict(config.field_mapping)
+    mapping: dict[str, str] = {}
+    for field in descriptor.resolved_fields():
+        target = field.default_target
+        if field.is_image and field.name in config.camera_names:
+            target = f"observation.images.{config.camera_names[field.name]}"
+        if target:
+            mapping[field.name] = target
+    return mapping
 
 
 def make_features(config: JobConfig, descriptor: DatasetDescriptor) -> dict[str, dict[str, Any]]:
     features: dict[str, dict[str, Any]] = {}
-    for camera, feature_key in camera_feature_map(config, descriptor).items():
-        features[feature_key] = {
-            "dtype": "video",
-            "shape": descriptor.camera_shapes[camera],
-            "names": ["height", "width", "channels"],
+    fields = {field.name: field for field in descriptor.resolved_fields()}
+    for source, target in resolved_field_mapping(config, descriptor).items():
+        field = fields[source]
+        if field.is_image:
+            features[target] = {
+                "dtype": "video",
+                "shape": field.shape,
+                "names": ["height", "width", "channels"],
+            }
+            continue
+        dimension = math.prod(field.shape)
+        names = list(field.names)
+        if target == "observation.state":
+            names = _dimension_names(config.state_names or names, dimension, "state")
+        elif target == "action":
+            names = _dimension_names(config.action_names or names, dimension, "action")
+        elif len(names) != dimension:
+            names = [f"{source}_{index}" for index in range(dimension)]
+        features[target] = {
+            "dtype": field.dtype,
+            "shape": field.shape,
+            "names": {"components": names} if len(field.shape) == 1 else None,
         }
-
-    state_names = _dimension_names(config.state_names, descriptor.state_dim, "state")
-    action_names = _dimension_names(config.action_names, descriptor.action_dim, "action")
-    features["observation.state"] = {
-        "dtype": "float32",
-        "shape": (descriptor.state_dim,),
-        "names": {"motors": state_names},
-    }
-    features["action"] = {
-        "dtype": "float32",
-        "shape": (descriptor.action_dim,),
-        "names": {"motors": action_names},
-    }
     return features
 
 
@@ -93,7 +112,12 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
             image_writer_processes=0,
         )
 
-        feature_map = camera_feature_map(config, descriptor)
+        field_map = resolved_field_mapping(config, descriptor)
+        field_definitions = {field.name: field for field in descriptor.resolved_fields()}
+        state_source = next(
+            (source for source, target in field_map.items() if target == "observation.state"),
+            None,
+        )
         total_frames = 0
         episode_lengths: list[int] = []
         source_records: list[dict[str, Any]] = []
@@ -101,24 +125,42 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
             for local_episode_index, (source_index, episode) in enumerate(zip(source_indices, episodes, strict=True)):
                 episode_frames = 0
                 for sample in adapter.iter_frames(episode):
-                    state = np.asarray(sample.state, dtype=np.float32).reshape(-1)
-                    action = np.asarray(sample.action, dtype=np.float32).reshape(-1)
-                    if state.size != descriptor.state_dim or action.size != descriptor.action_dim:
-                        raise ValueError(
-                            f"Dimension mismatch in {episode.path}: state={state.size}, action={action.size}"
-                        )
-                    if config.skip_zero_state and np.all(state == 0):
+                    values = sample.as_fields()
+                    if state_source is not None and state_source not in values:
+                        raise ValueError(f"Missing mapped field {state_source} in {episode.path}")
+                    if (
+                        config.skip_zero_state
+                        and state_source is not None
+                        and np.all(np.asarray(values[state_source]) == 0)
+                    ):
                         continue
 
-                    frame: dict[str, Any] = {"observation.state": state, "action": action}
-                    for camera, feature_key in feature_map.items():
-                        image = sample.images.get(camera)
-                        if image is None:
-                            raise ValueError(f"Missing or invalid {camera} frame in {episode.path}")
-                        expected_h, expected_w, _ = descriptor.camera_shapes[camera]
-                        if image.shape[:2] != (expected_h, expected_w):
-                            image = cv2.resize(image, (expected_w, expected_h), interpolation=cv2.INTER_AREA)
-                        frame[feature_key] = np.ascontiguousarray(image, dtype=np.uint8)
+                    frame: dict[str, Any] = {}
+                    for source, target in field_map.items():
+                        if source not in values:
+                            raise ValueError(f"Missing mapped field {source} in {episode.path}")
+                        field = field_definitions[source]
+                        if field.is_image:
+                            image = np.asarray(values[source])
+                            if image.ndim != 3 or image.shape[-1] < 3:
+                                raise ValueError(f"Invalid image field {source} in {episode.path}")
+                            expected_h, expected_w, expected_c = field.shape
+                            image = image[:, :, :expected_c]
+                            if image.shape[:2] != (expected_h, expected_w):
+                                image = cv2.resize(
+                                    image,
+                                    (expected_w, expected_h),
+                                    interpolation=cv2.INTER_AREA,
+                                )
+                            frame[target] = np.ascontiguousarray(image, dtype=np.uint8)
+                            continue
+                        value = np.asarray(values[source], dtype=np.dtype(field.dtype))
+                        if value.size != math.prod(field.shape):
+                            raise ValueError(
+                                f"Shape mismatch for {source} in {episode.path}: "
+                                f"{value.shape} cannot become {field.shape}"
+                            )
+                        frame[target] = np.ascontiguousarray(value.reshape(field.shape))
 
                     dataset.add_frame(frame, config.task_instruction)
                     episode_frames += 1

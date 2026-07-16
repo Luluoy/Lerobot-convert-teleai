@@ -124,7 +124,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             adapter = create_adapter(config.adapter, config.source_path, config.adapter_options)
             image = adapter.preview(descriptor.episodes[episode_index], raw_camera, frame_index)
         else:
-            feature_key = camera_feature_map(config, descriptor)[raw_camera]
+            feature_map = camera_feature_map(config, descriptor)
+            if raw_camera not in feature_map:
+                raise ValueError(f"Camera field is not mapped to LeRobot output: {raw_camera}")
+            feature_key = feature_map[raw_camera]
             final_root = Path(config.output_path)
             if record["state"] == "completed" and final_root.exists():
                 image = preview_output_frame(
