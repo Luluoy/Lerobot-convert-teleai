@@ -17,6 +17,21 @@ cd ~/.coding-ground/loy/lerobot_dataconvert
 LEROBOT_DATACONVERT_PYTHON=/path/to/python ./start.sh --port 8765
 ```
 
+安装为随当前用户登录自动启动的 systemd 服务：
+
+```bash
+./install-systemd-service.sh
+```
+
+服务日志和常用管理命令：
+
+```bash
+systemctl --user status lerobot-dataconvert
+journalctl --user -u lerobot-dataconvert -f
+systemctl --user restart lerobot-dataconvert
+systemctl --user stop lerobot-dataconvert
+```
+
 也可以安装到一个含 LeRobot 0.3.3 的环境：
 
 ```bash
