@@ -31,6 +31,21 @@
     </div>
   </header>
 
+  <section class="backend-notice" id="backendNotice" role="alert" hidden>
+    <i data-lucide="server-off" aria-hidden="true"></i>
+    <div>
+      <strong>后端未连接</strong>
+      <p>首次部署请让 Agent 按根目录 INSTALL.md 安装；已安装请重启服务后重新检测。</p>
+      <code>systemctl --user restart lerobot-dataconvert</code>
+    </div>
+    <div class="backend-notice-actions">
+      <a class="text-command" href="https://github.com/Luluoy/Lerobot-convert-teleai/blob/main/INSTALL.md" target="_blank" rel="noreferrer">安装引导</a>
+      <button class="secondary-command" id="backendRetry" type="button">
+        <i data-lucide="refresh-cw"></i><span>重新检测</span>
+      </button>
+    </div>
+  </section>
+
   <main class="workspace">
     <aside class="control-rail" aria-label="转换设置">
       <form id="jobForm">
@@ -86,11 +101,43 @@
           <div id="fieldMapping" class="field-mapping" hidden></div>
         </section>
 
+        <section class="rail-section motion-section">
+          <div class="section-title"><span>03</span><h2>动作过滤</h2></div>
+          <div class="motion-action-fields" id="motionActionFields" hidden>
+            <span>ACTION FIELDS</span><strong></strong>
+          </div>
+          <div class="toggle-row motion-toggles">
+            <label><input id="trimStationaryStart" type="checkbox"><span>删除 Episode 起始静止帧</span></label>
+            <label><input id="removeStationarySegments" type="checkbox"><span>删除连续静止冗余帧</span></label>
+          </div>
+          <div class="range-field disabled" id="stationaryFramesField">
+            <div><label for="stationaryFrames">连续不动阈值</label><output id="stationaryFramesOutput" for="stationaryFrames">20 FR</output></div>
+            <input id="stationaryFrames" name="stationary_frames" type="range" min="2" max="600" value="20" disabled>
+          </div>
+          <button class="secondary-command" id="motionScanButton" type="button" disabled>
+            <i data-lucide="scan-search"></i><span>预扫描</span>
+          </button>
+          <div class="dataset-readout motion-scan-readout" id="motionScanReadout" hidden></div>
+        </section>
+
+        <section class="rail-section compression-section">
+          <div class="section-title"><span>04</span><h2>视频压缩</h2></div>
+          <div class="range-field">
+            <div><label for="videoCrf">AV1 压缩质量</label><output id="videoCrfOutput" for="videoCrf">CRF 30</output></div>
+            <input id="videoCrf" name="video_crf" type="range" min="0" max="63" value="30" aria-label="AV1 视频压缩质量">
+            <div class="range-scale" aria-hidden="true"><span>高画质</span><span>均衡</span><span>高压缩</span></div>
+          </div>
+        </section>
+
         <section class="rail-section resources-section">
-          <div class="section-title"><span>03</span><h2>资源限制</h2></div>
+          <div class="section-title"><span>05</span><h2>资源限制</h2></div>
           <div class="range-field">
             <div><label for="cpuCores">CPU 核心</label><output id="cpuOutput" for="cpuCores">--</output></div>
             <input id="cpuCores" name="cpu_cores" type="range" min="1" max="1" value="1">
+          </div>
+          <div class="range-field">
+            <div><label for="cpuLimitPercent">CPU 占用上限</label><output id="cpuLimitOutput" for="cpuLimitPercent">95% MAX</output></div>
+            <input id="cpuLimitPercent" name="cpu_limit_percent" type="range" min="1" max="95" value="95">
           </div>
           <div class="range-field">
             <div><label for="memoryGb">内存预算</label><output id="memoryOutput" for="memoryGb">--</output></div>
@@ -101,7 +148,6 @@
             <input id="segmentSize" name="segment_size" type="range" min="1" max="8" value="2">
           </div>
           <div class="toggle-row">
-            <label><input id="skipZeroState" type="checkbox" checked><span>跳过全零 state</span></label>
             <label><input id="overwriteOutput" type="checkbox"><span>覆盖已有输出</span></label>
           </div>
         </section>

@@ -75,6 +75,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     payload["adapter"], payload["source_path"], payload.get("adapter_options")
                 )
                 self._json(descriptor)
+            elif parsed.path == "/api/motion-scan":
+                self._json(self.server.manager.scan_motion(payload))
             elif parsed.path == "/api/preview/raw":
                 adapter = create_adapter(
                     payload["adapter"], payload["source_path"], payload.get("adapter_options") or {}

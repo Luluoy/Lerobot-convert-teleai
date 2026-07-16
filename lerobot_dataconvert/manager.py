@@ -12,7 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import psutil
 
@@ -25,12 +25,54 @@ from .conversion import (
     run_segment_worker,
 )
 from .models import DatasetDescriptor, JobConfig
+from .motion import scan_dataset_motion
 
 
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 ACTIVE_STATES = {"queued", "running", "merging", "stopping"}
 RESERVED_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 FEATURE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*$")
+MAX_CPU_LIMIT_PERCENT = 95
+
+
+class _CpuDutyCycleGovernor:
+    def __init__(
+        self,
+        process_provider: Callable[[], list[multiprocessing.Process]],
+        limit_percent: int,
+        period_seconds: float = 0.1,
+    ):
+        self.process_provider = process_provider
+        self.limit_percent = max(1, min(int(limit_percent), MAX_CPU_LIMIT_PERCENT))
+        self.period_seconds = period_seconds
+        self.run_seconds = period_seconds * self.limit_percent / 100
+        self.pause_seconds = period_seconds - self.run_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="worker-cpu-governor",
+            daemon=True,
+        )
+
+    def __enter__(self) -> "_CpuDutyCycleGovernor":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.stop()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=max(1.0, self.period_seconds * 3))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.run_seconds):
+            suspended = _suspend_processes(self.process_provider())
+            try:
+                if self._stop.wait(self.pause_seconds):
+                    return
+            finally:
+                _resume_processes(suspended)
 
 
 class JobStore:
@@ -125,10 +167,26 @@ class JobManager:
     ) -> dict[str, Any]:
         return create_adapter(adapter_slug, source_path, options or {}).inspect().to_dict()
 
+    def scan_motion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source_path = str(Path(payload["source_path"]).expanduser().resolve())
+        adapter_options = dict(payload.get("adapter_options") or {})
+        adapter = create_adapter(payload["adapter"], source_path, adapter_options)
+        descriptor = adapter.inspect()
+        trim_start, remove_segments, stationary_frames = _normalize_motion_rules(payload)
+        return scan_dataset_motion(
+            adapter,
+            descriptor,
+            trim_start,
+            remove_segments,
+            stationary_frames,
+        )
+
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
         source_path = str(Path(payload["source_path"]).expanduser().resolve())
         output_path = str(Path(payload["output_path"]).expanduser().resolve())
         adapter_options = dict(payload.get("adapter_options") or {})
+        if "fps" not in adapter_options and payload.get("fps") is not None:
+            adapter_options["fps"] = payload["fps"]
         descriptor = create_adapter(payload["adapter"], source_path, adapter_options).inspect()
         config = self._normalize_config(payload, descriptor, source_path, output_path, adapter_options)
         self._validate_paths(config)
@@ -168,6 +226,9 @@ class JobManager:
                     "status": "pending",
                     "attempts": 0,
                     "frames": 0,
+                    "processed_frames": 0,
+                    "removed_frames": 0,
+                    "removed_segments": 0,
                     "bytes": 0,
                     "duration_seconds": 0,
                 }
@@ -298,6 +359,9 @@ class JobManager:
         repo_id = _safe_repo_id(payload.get("repo_id") or Path(output_path).name)
         state_names = [str(value).strip() for value in payload.get("state_names", []) if str(value).strip()]
         action_names = [str(value).strip() for value in payload.get("action_names", []) if str(value).strip()]
+        trim_start, remove_segments, stationary_frames = _normalize_motion_rules(payload)
+        if (trim_start or remove_segments) and not descriptor.resolved_action_fields():
+            raise ValueError("The raw dataset adapter did not declare any action fields")
         return JobConfig(
             adapter=payload["adapter"],
             source_path=source_path,
@@ -306,16 +370,24 @@ class JobManager:
             repo_id=repo_id,
             robot_type=str(payload.get("robot_type") or "unknown").strip(),
             task_instruction=task_instruction,
-            fps=max(1, int(payload.get("fps") or descriptor.fps)),
+            fps=descriptor.fps,
             cpu_cores=cpu_cores,
             memory_gb=memory_gb,
             segment_size=max(1, min(int(payload.get("segment_size", 2)), 16)),
             camera_names=camera_names,
             state_names=state_names,
             action_names=action_names,
+            video_crf=max(0, min(int(payload.get("video_crf", 30)), 63)),
+            cpu_limit_percent=max(
+                1,
+                min(int(payload.get("cpu_limit_percent", 95)), MAX_CPU_LIMIT_PERCENT),
+            ),
             field_mapping=field_mapping,
-            adapter_options={**adapter_options, "fps": max(1, int(payload.get("fps") or descriptor.fps))},
-            skip_zero_state=bool(payload.get("skip_zero_state", True)),
+            adapter_options={**adapter_options, "fps": descriptor.fps},
+            trim_stationary_start=trim_start,
+            remove_stationary_segments=remove_segments,
+            stationary_frames=stationary_frames,
+            skip_zero_state=False,
             overwrite=bool(payload.get("overwrite", False)),
         )
 
@@ -349,7 +421,12 @@ class JobManager:
             record = queued[0]
             self._current_job_id = record["id"]
             try:
-                self._run_job(record)
+                config = JobConfig.from_dict(record["config"])
+                with _CpuDutyCycleGovernor(
+                    self._active_processes,
+                    config.cpu_limit_percent,
+                ):
+                    self._run_job(record)
             except BaseException as exc:
                 self.store.patch(
                     record["id"],
@@ -362,6 +439,12 @@ class JobManager:
             finally:
                 self._current_job_id = None
                 self._current_processes.clear()
+
+    def _active_processes(self) -> list[multiprocessing.Process]:
+        try:
+            return list(self._current_processes.values())
+        except RuntimeError:
+            return []
 
     def _run_job(self, record: dict[str, Any]) -> None:
         job_id = record["id"]
@@ -451,6 +534,7 @@ class JobManager:
                     "output_dir": output_dir,
                     "cpu_id": cpu_id,
                     "frames": 0,
+                    "processed_frames": 0,
                     "terminal": False,
                 }
                 self._current_processes[segment["id"]] = process
@@ -502,6 +586,7 @@ class JobManager:
                 continue
             if message["type"] == "progress":
                 item["frames"] = int(message["frames"])
+                item["processed_frames"] = int(message.get("processed_frames", message["frames"]))
                 continue
             item["terminal"] = True
             process = item["process"]
@@ -513,6 +598,9 @@ class JobManager:
                     {
                         "status": "done",
                         "frames": int(message["frames"]),
+                        "processed_frames": int(message.get("processed_frames", message["frames"])),
+                        "removed_frames": int(message.get("removed_frames", 0)),
+                        "removed_segments": int(message.get("removed_segments", 0)),
                         "bytes": int(message["bytes"]),
                         "duration_seconds": float(message["duration_seconds"]),
                         "peak_memory_mb": float(message["peak_memory_mb"]),
@@ -545,6 +633,9 @@ class JobManager:
                     {
                         "status": "done",
                         "frames": int(marker["frames"]),
+                        "processed_frames": int(marker.get("processed_frames", marker["frames"])),
+                        "removed_frames": int(marker.get("removed_frames", 0)),
+                        "removed_segments": int(marker.get("removed_segments", 0)),
                         "bytes": int(marker["bytes"]),
                         "duration_seconds": float(marker["duration_seconds"]),
                         "peak_memory_mb": float(marker.get("peak_memory_mb", 0)),
@@ -585,13 +676,19 @@ class JobManager:
         completed = [segment for segment in manifest["segments"] if segment["status"] == "done"]
         completed_frames = sum(int(segment.get("frames", 0)) for segment in completed)
         active_frames = sum(int(item.get("frames", 0)) for item in active.values())
-        progress_frames = completed_frames + active_frames
+        completed_processed = sum(
+            int(segment.get("processed_frames", segment.get("frames", 0))) for segment in completed
+        )
+        active_processed = sum(
+            int(item.get("processed_frames", item.get("frames", 0))) for item in active.values()
+        )
+        progress_frames = completed_processed + active_processed
         total_frames = max(descriptor.total_frames, 1)
         fraction = min(progress_frames / total_frames, 0.995)
         written = sum(int(segment.get("bytes", 0)) for segment in completed)
         estimated = (
-            int(written / completed_frames * descriptor.total_frames)
-            if completed_frames > 0
+            int(written / completed_processed * descriptor.total_frames)
+            if completed_processed > 0
             else int(descriptor.source_bytes * 0.4)
         )
         eta = max(0, elapsed / fraction - elapsed) if fraction > 0.002 else None
@@ -608,6 +705,8 @@ class JobManager:
             completed_episodes=sum(segment["end"] - segment["start"] for segment in completed),
             completed_frames=completed_frames,
             active_frames=active_frames,
+            removed_frames=sum(int(segment.get("removed_frames", 0)) for segment in completed),
+            removed_segments=sum(int(segment.get("removed_segments", 0)) for segment in completed),
             written_bytes=written,
             estimated_output_bytes=estimated,
             eta_seconds=eta,
@@ -730,6 +829,8 @@ class JobManager:
             completed_episodes=len(descriptor.episodes),
             completed_frames=int(result["frames"]),
             active_frames=0,
+            removed_frames=sum(int(segment.get("removed_frames", 0)) for segment in manifest["segments"]),
+            removed_segments=sum(int(segment.get("removed_segments", 0)) for segment in manifest["segments"]),
             written_bytes=int(result["bytes"]),
             estimated_output_bytes=int(result["bytes"]),
             eta_seconds=0,
@@ -755,6 +856,9 @@ class JobManager:
                     {
                         "status": "done",
                         "frames": int(marker["frames"]),
+                        "processed_frames": int(marker.get("processed_frames", marker["frames"])),
+                        "removed_frames": int(marker.get("removed_frames", 0)),
+                        "removed_segments": int(marker.get("removed_segments", 0)),
                         "bytes": int(marker["bytes"]),
                         "duration_seconds": float(marker["duration_seconds"]),
                         "peak_memory_mb": float(marker.get("peak_memory_mb", 0)),
@@ -793,6 +897,11 @@ class JobManager:
         descriptor = DatasetDescriptor.from_dict(manifest["descriptor"])
         completed = [segment for segment in manifest["segments"] if segment["status"] == "done"]
         completed_frames = sum(int(segment.get("frames", 0)) for segment in completed)
+        completed_processed = sum(
+            int(segment.get("processed_frames", segment.get("frames", 0))) for segment in completed
+        )
+        removed_frames = sum(int(segment.get("removed_frames", 0)) for segment in completed)
+        removed_segments = sum(int(segment.get("removed_segments", 0)) for segment in completed)
         completed_episodes = sum(segment["end"] - segment["start"] for segment in completed)
         now = time.time()
         state = manifest.get("state", "queued")
@@ -811,7 +920,7 @@ class JobManager:
             "finished_at": now if state == "completed" else None,
             "active_seconds": float(manifest.get("active_seconds", 0)),
             "elapsed_seconds": float(manifest.get("active_seconds", 0)),
-            "progress": 1.0 if state == "completed" else completed_frames / max(descriptor.total_frames, 1) * 0.94,
+            "progress": 1.0 if state == "completed" else completed_processed / max(descriptor.total_frames, 1) * 0.94,
             "completed_segments": len(completed),
             "total_segments": len(manifest["segments"]),
             "completed_episodes": completed_episodes,
@@ -819,6 +928,8 @@ class JobManager:
             "completed_frames": completed_frames,
             "total_frames": descriptor.total_frames,
             "active_frames": 0,
+            "removed_frames": removed_frames,
+            "removed_segments": removed_segments,
             "written_bytes": sum(int(segment.get("bytes", 0)) for segment in completed),
             "estimated_output_bytes": int(descriptor.source_bytes * 0.4),
             "eta_seconds": None,
@@ -856,6 +967,14 @@ def _safe_name(value: str) -> str:
 def _default_camera_name(camera: str) -> str:
     match = re.search(r"(\d+)$", camera)
     return f"image_{match.group(1)}" if match else camera
+
+
+def _normalize_motion_rules(payload: dict[str, Any]) -> tuple[bool, bool, int]:
+    return (
+        bool(payload.get("trim_stationary_start", False)),
+        bool(payload.get("remove_stationary_segments", False)),
+        max(2, min(int(payload.get("stationary_frames", 20)), 100_000)),
+    )
 
 
 def _normalize_field_mapping(
@@ -918,6 +1037,7 @@ def _path_size(path: Path) -> int:
 
 
 def _terminate_process(process: multiprocessing.Process) -> None:
+    _resume_processes(_process_tree(process))
     if not process.is_alive():
         process.join(timeout=1)
         return
@@ -926,3 +1046,39 @@ def _terminate_process(process: multiprocessing.Process) -> None:
     if process.is_alive():
         process.kill()
         process.join(timeout=2)
+
+
+def _process_tree(process: multiprocessing.Process) -> list[psutil.Process]:
+    if process.pid is None or not process.is_alive():
+        return []
+    try:
+        root = psutil.Process(process.pid)
+        return [*root.children(recursive=True), root]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+
+
+def _suspend_processes(processes: list[multiprocessing.Process]) -> list[psutil.Process]:
+    suspended: list[psutil.Process] = []
+    seen: set[int] = set()
+    for process in processes:
+        for target in _process_tree(process):
+            if target.pid in seen:
+                continue
+            seen.add(target.pid)
+            try:
+                if target.status() == psutil.STATUS_STOPPED:
+                    continue
+                target.suspend()
+                suspended.append(target)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    return suspended
+
+
+def _resume_processes(processes: list[psutil.Process]) -> None:
+    for process in reversed(processes):
+        try:
+            process.resume()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue

@@ -4,7 +4,9 @@ from pathlib import Path
 import json
 import queue
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 import cv2
 import h5py
@@ -19,6 +21,8 @@ from lerobot_dataconvert.conversion import (
     run_segment_worker,
 )
 from lerobot_dataconvert.models import JobConfig
+from lerobot_dataconvert.manager import MAX_CPU_LIMIT_PERCENT, _CpuDutyCycleGovernor
+from lerobot_dataconvert.motion import analyze_action_sequence
 
 
 def create_synthetic_hdf5(root: Path, episodes: int = 3, frames: int = 6) -> None:
@@ -43,7 +47,9 @@ def create_synthetic_hdf5(root: Path, episodes: int = 3, frames: int = 6) -> Non
                     dataset[frame_index] = encoded.reshape(-1)
 
 
-def make_config(source: Path, output: Path, revision: str = "v2.1") -> JobConfig:
+def make_config(
+    source: Path, output: Path, revision: str = "v2.1", video_crf: int = 30
+) -> JobConfig:
     return JobConfig(
         adapter="hdf5_joint",
         source_path=str(source),
@@ -59,12 +65,93 @@ def make_config(source: Path, output: Path, revision: str = "v2.1") -> JobConfig
         camera_names={"camera_0": "head", "camera_1": "wrist"},
         state_names=[f"joint_{index}" for index in range(4)],
         action_names=[f"joint_{index}" for index in range(4)],
+        video_crf=video_crf,
         adapter_options={"fps": 20},
         skip_zero_state=False,
     )
 
 
 class ConversionTest(unittest.TestCase):
+    def test_cpu_governor_caps_worker_duty_cycle_at_95_percent(self) -> None:
+        with (
+            patch("lerobot_dataconvert.manager._suspend_processes", return_value=[]) as suspend,
+            patch("lerobot_dataconvert.manager._resume_processes") as resume,
+        ):
+            governor = _CpuDutyCycleGovernor(lambda: [object()], 100, period_seconds=0.02)
+            self.assertEqual(governor.limit_percent, MAX_CPU_LIMIT_PERCENT)
+            self.assertAlmostEqual(governor.run_seconds, 0.019)
+            self.assertAlmostEqual(governor.pause_seconds, 0.001)
+            with governor:
+                time.sleep(0.07)
+            self.assertGreaterEqual(suspend.call_count, 2)
+            self.assertEqual(resume.call_count, suspend.call_count)
+
+    def test_motion_analysis_uses_all_declared_action_fields(self) -> None:
+        values = [
+            {"joint": [0], "eef": [0]},
+            {"joint": [0], "eef": [0]},
+            {"joint": [0], "eef": [1]},
+            {"joint": [0], "eef": [1]},
+            {"joint": [0], "eef": [1]},
+            {"joint": [2], "eef": [1]},
+        ]
+        result = analyze_action_sequence(values, ["joint", "eef"], 6, True, True, 3)
+        self.assertEqual(
+            result["segments"],
+            [
+                {"start": 0, "end": 2, "kind": "leading", "frames": 2},
+                {"start": 3, "end": 5, "kind": "stationary", "frames": 2},
+            ],
+        )
+        self.assertEqual(result["kept_frames"], 2)
+
+    def test_video_crf_is_forwarded_to_lerobot_encoder(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lerobot-video-crf-test-") as temporary:
+            root = Path(temporary)
+            source = root / "raw"
+            create_synthetic_hdf5(source, episodes=1, frames=3)
+            descriptor = create_adapter("hdf5_joint", str(source), {"fps": 20}).inspect()
+            config = make_config(source, root / "output", video_crf=22)
+            legacy_config = config.to_dict()
+            legacy_config.pop("video_crf")
+            legacy_config.pop("cpu_limit_percent")
+            self.assertEqual(JobConfig.from_dict(legacy_config).video_crf, 30)
+            self.assertEqual(JobConfig.from_dict(legacy_config).cpu_limit_percent, 95)
+
+            try:
+                from lerobot.datasets import lerobot_dataset as dataset_module
+            except ModuleNotFoundError:
+                from lerobot.common.datasets import lerobot_dataset as dataset_module
+
+            encoded_crfs: list[int] = []
+            original_encoder = dataset_module.encode_video_frames
+
+            def recording_encoder(*args, **kwargs):
+                encoded_crfs.append(kwargs["crf"])
+                return original_encoder(*args, **kwargs)
+
+            messages: queue.Queue = queue.Queue()
+            with patch.object(dataset_module, "encode_video_frames", recording_encoder):
+                run_segment_worker(
+                    {
+                        "segment_id": "000000",
+                        "output_dir": str(root / "segment"),
+                        "config": config.to_dict(),
+                        "descriptor": descriptor.to_dict(),
+                        "source_indices": [0],
+                        "episodes": [descriptor.episodes[0].to_dict()],
+                        "cpu_id": None,
+                    },
+                    messages,
+                )
+
+            results = []
+            while not messages.empty():
+                results.append(messages.get())
+            failures = [message for message in results if message["type"] == "failed"]
+            self.assertFalse(failures, failures[0]["traceback"] if failures else "")
+            self.assertEqual(encoded_crfs, [22, 22])
+
     def test_adapter_segment_merge_and_revisions(self) -> None:
         with tempfile.TemporaryDirectory(prefix="lerobot-convert-test-") as temporary:
             root = Path(temporary)

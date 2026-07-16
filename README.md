@@ -2,6 +2,9 @@
 
 本地多进程 LeRobot 数据转换工作台。后端使用 Python、SQLite 和原子 JSON manifest，前端是无构建步骤的 PWA。
 
+首次部署请阅读 [`INSTALL.md`](./INSTALL.md)。后续 Agent 修改本工程前必须遵循
+[`skills/maintain-lerobot-converter/SKILL.md`](./skills/maintain-lerobot-converter/SKILL.md)。
+
 ## 启动
 
 本机已有的 `lerobot21` Conda 环境包含运行依赖：
@@ -58,7 +61,7 @@ Cache 位于输出目录旁边：
 
 选择 v3.0 时，原始数据仍只转换一次。完成的 v2.1 segments 先合并，再在可中断的 finalizer 进程中打包为 v3.0；半成品 finalizer 目录在恢复时直接丢弃。
 
-CPU 滑杆决定 worker 数以及可用 CPU 集，每个 worker 固定到一个核心。内存预算结合适配器给出的单 worker 估算限制并发数，任务详情显示实际 worker 数和实时 RSS。
+CPU 核心滑杆决定 worker 数以及可用 CPU 集，每个 worker 固定到一个核心；CPU 占用上限可向下调节但最高为 95%，调度器会同时限速 worker 及其编码子进程。内存预算结合适配器给出的单 worker 估算限制并发数，任务详情显示实际 worker 数和实时 RSS。
 
 ## 原始数据适配器
 
@@ -78,6 +81,7 @@ class MyAdapter(RawDatasetAdapter):
     def inspect(self):
         # DatasetDescriptor(..., fields=[
         #     RawField("robot/qpos", (14,), default_target="observation.state"),
+        #     RawField("robot/action", (14,), default_target="action", is_action=True),
         #     RawField("front", (480, 640, 3), "uint8", True,
         #              "observation.images.front"),
         # ])
@@ -92,7 +96,11 @@ class MyAdapter(RawDatasetAdapter):
         ...
 ```
 
-扫描后，PWA 会按行显示原始字段类型和 shape。目标字段可从常用 LeRobot 字段中选择或直接输入自定义 feature；目标留空表示不转换该字段。映射随任务写入 cache，恢复时保持不变。Cache、进程调度、资源限制、LeRobot 写入、revision、合并和 ETA 不需要在适配器中实现。
+动作过滤使用所有 `is_action=True` 的原始字段；任意一个字段变化即视为发生动作。基类的
+`iter_action_values()` 默认复用 `iter_frames()`，适配器可覆写该方法，只读取 action 流，
+避免预扫描时解码图像。每个 episode 始终至少保留一帧。
+
+扫描后，PWA 会按行显示原始字段类型、shape 和字段 FPS。目标字段可从常用 LeRobot 字段中选择或直接输入自定义 feature；目标留空表示不转换该字段。映射随任务写入 cache，恢复时保持不变。Cache、进程调度、资源限制、LeRobot 写入、revision、合并和 ETA 不需要在适配器中实现。
 
 把适配器模块加入环境变量即可在服务启动时加载：
 
@@ -115,8 +123,13 @@ LEROBOT_DATACONVERT_PLUGINS=my_project.my_adapter ./start.sh
 - `episode_XXXXXX/META/meta.json` 中状态为 `complete` 且没有保存错误的 episode。
 - `joint_state` 的 `qpos/qvel/torque`、`joint_action/action` 和 `eef_action/action` 逐帧 PKL 字段。
 - `Cam*` PNG 相机流，以及 META 中配置的任意相机数据集名称。
-- 从 META 自动读取 FPS、关节/EEF 分量名称、相机名称和图像 shape。
+- 每个原始字段都声明自己的 FPS；优先读取 META 的正数 `actual_fps`，否则使用 `nominal_fps`。
+- 目标 FPS 可留空自动选择，且必须是正整数并不高于所有 episode、所有字段中的最低 FPS。
+- 以所有字段公共时间区间的起点生成目标 FPS 时间轴；每个触发点分别选择各传感器时间戳最近的样本，距离相同时选择较早样本。
+- 从 META 自动读取关节/EEF 分量名称、相机名称和图像 shape。
 - 不完整或布局不一致的 episode 会跳过并在扫描结果中报告。
+
+转换 job 创建时会一次性生成全部 segment 的 trajectory 清单。每个 `source_indices` 清单互不重叠且合起来覆盖全部 episode，子进程只接收自己 segment 的清单；后续动态启动仅用于限制并发和失败恢复，不会让 worker 争抢 trajectory。
 
 该格式使用 Python pickle，只应加载 TeleAxis Collector 在本机生成的可信数据。相机引用会被限制在对应 episode 和相机目录内。
 

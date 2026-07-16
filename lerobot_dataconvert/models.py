@@ -28,6 +28,8 @@ class RawField:
     is_image: bool = False
     default_target: str = ""
     names: tuple[str, ...] = ()
+    is_action: bool = False
+    fps: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -37,6 +39,7 @@ class RawField:
         value = dict(value)
         value["shape"] = tuple(int(size) for size in value["shape"])
         value["names"] = tuple(str(name) for name in value.get("names", ()))
+        value["fps"] = float(value.get("fps", 0.0))
         return cls(**value)
 
 
@@ -62,14 +65,15 @@ class DatasetDescriptor:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["total_frames"] = self.total_frames
+        data["max_output_fps"] = self.max_output_fps
         return data
 
     def resolved_fields(self) -> list[RawField]:
         if self.fields:
             return list(self.fields)
         fields = [
-            RawField("state", (self.state_dim,), default_target="observation.state"),
-            RawField("action", (self.action_dim,), default_target="action"),
+            RawField("state", (self.state_dim,), default_target="observation.state", fps=self.fps),
+            RawField("action", (self.action_dim,), default_target="action", is_action=True, fps=self.fps),
         ]
         fields.extend(
             RawField(
@@ -78,15 +82,29 @@ class DatasetDescriptor:
                 dtype="uint8",
                 is_image=True,
                 default_target=f"observation.images.{camera}",
+                fps=self.fps,
             )
             for camera in self.cameras
         )
         return fields
 
+    def resolved_action_fields(self) -> list[RawField]:
+        return [
+            field
+            for field in self.resolved_fields()
+            if field.is_action or field.default_target == "action"
+        ]
+
+    @property
+    def max_output_fps(self) -> float:
+        rates = [field.fps for field in self.resolved_fields() if field.fps > 0]
+        return min(rates) if rates else float(self.fps)
+
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DatasetDescriptor":
         value = dict(value)
         value.pop("total_frames", None)
+        value.pop("max_output_fps", None)
         value["episodes"] = [EpisodeRef.from_dict(item) for item in value["episodes"]]
         value["camera_shapes"] = {
             key: tuple(shape) for key, shape in value["camera_shapes"].items()
@@ -130,8 +148,13 @@ class JobConfig:
     camera_names: dict[str, str]
     state_names: list[str]
     action_names: list[str]
+    video_crf: int = 30
+    cpu_limit_percent: int = 95
     field_mapping: dict[str, str] = field(default_factory=dict)
     adapter_options: dict[str, Any] = field(default_factory=dict)
+    trim_stationary_start: bool = False
+    remove_stationary_segments: bool = False
+    stationary_frames: int = 20
     skip_zero_state: bool = True
     overwrite: bool = False
 

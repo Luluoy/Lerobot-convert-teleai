@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from bisect import bisect_left
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from importlib import import_module
 from importlib.metadata import entry_points
 from pathlib import Path
 import json
+import math
 import os
 import pickle
 import re
@@ -75,6 +78,13 @@ class RawDatasetAdapter(ABC):
     @abstractmethod
     def iter_frames(self, episode: EpisodeRef) -> Iterator[FrameSample]:
         raise NotImplementedError
+
+    def iter_action_values(
+        self, episode: EpisodeRef, action_fields: Sequence[str]
+    ) -> Iterator[dict[str, Any]]:
+        for sample in self.iter_frames(episode):
+            values = sample.as_fields()
+            yield {name: values[name] for name in action_fields if name in values}
 
     @abstractmethod
     def preview(self, episode: EpisodeRef, camera: str, frame_index: int) -> np.ndarray:
@@ -193,9 +203,10 @@ class HDF5JointAdapter(RawDatasetAdapter):
 
         pixels = sum(shape[0] * shape[1] for shape in camera_shapes.values())
         memory_mb = max(768, min(4096, int(640 + pixels * 10 / (1024 * 1024))))
+        fps = int(self.options.get("fps", 20))
         fields = [
-            RawField("state", (state_dim,), default_target="observation.state"),
-            RawField("action", (action_dim,), default_target="action"),
+            RawField("state", (state_dim,), default_target="observation.state", fps=fps),
+            RawField("action", (action_dim,), default_target="action", is_action=True, fps=fps),
         ]
         fields.extend(
             RawField(
@@ -204,6 +215,7 @@ class HDF5JointAdapter(RawDatasetAdapter):
                 dtype="uint8",
                 is_image=True,
                 default_target=f"observation.images.{_default_camera_name(camera)}",
+                fps=fps,
             )
             for camera in cameras
         )
@@ -211,7 +223,7 @@ class HDF5JointAdapter(RawDatasetAdapter):
             adapter=self.slug,
             source_path=self.source_path,
             episodes=episodes,
-            fps=int(self.options.get("fps", 20)),
+            fps=fps,
             cameras=cameras,
             camera_shapes=camera_shapes,
             state_dim=state_dim,
@@ -264,6 +276,27 @@ class HDF5JointAdapter(RawDatasetAdapter):
                     },
                     frame_index / fps,
                 )
+
+    def iter_action_values(
+        self, episode: EpisodeRef, action_fields: Sequence[str]
+    ) -> Iterator[dict[str, Any]]:
+        if list(action_fields) != ["action"]:
+            raise ValueError(f"Unsupported HDF5 action fields: {', '.join(action_fields)}")
+        path = Path(episode.path)
+        if path.is_dir():
+            for frame_path in self._list_frame_files(path)[: episode.frame_count]:
+                with h5py.File(frame_path, "r") as handle:
+                    _, schema = self._detect_schema(handle)
+                    action = np.asarray(handle[schema["action"]], dtype=np.float32).reshape(-1)
+                yield {"action": action}
+            return
+
+        with h5py.File(path, "r") as handle:
+            _, schema = self._detect_schema(handle)
+            action = np.asarray(handle[schema["action"]], dtype=np.float32)
+            action = action[None, :] if action.ndim == 1 else action
+            for frame_index in range(min(len(action), episode.frame_count)):
+                yield {"action": np.asarray(action[frame_index], dtype=np.float32).reshape(-1)}
 
     def preview(self, episode: EpisodeRef, camera: str, frame_index: int) -> np.ndarray:
         path = Path(episode.path)
@@ -367,9 +400,29 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
     slug = "multiprocessing_pool_dataset"
     display_name = "MultiProcessing Pool Dataset"
     description = "Trusted TeleAxis Collector schema-v3 PKL streams and PNG cameras."
+    options_schema = [
+        {
+            "key": "fps",
+            "label": "目标 FPS（留空自动）",
+            "type": "number",
+            "default": "",
+            "min": 1,
+            "max": 240,
+            "step": 1,
+            "placeholder": "自动使用最低字段帧率",
+        },
+    ]
 
     _EPISODE_RE = re.compile(r"episode_(\d+)$")
     _FRAME_RE = re.compile(r"frame_(\d{9})_(\d+)\.pkl$")
+    _IMAGE_RE = re.compile(r"frame_(\d{9})_(\d+)\.png$")
+    _NUMERIC_FIELDS = {
+        "joint_state/qpos": ("joint_state", "state", "qpos"),
+        "joint_state/qvel": ("joint_state", "state", "qvel"),
+        "joint_state/torque": ("joint_state", "state", "torque"),
+        "joint_action/action": ("joint_action", "action", "action"),
+        "eef_action/action": ("eef_action", "action", "action"),
+    }
 
     def inspect(self) -> DatasetDescriptor:
         source = Path(self.source_path)
@@ -377,9 +430,10 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
         if not episode_paths:
             raise ValueError(f"No TeleAxis Collector episodes found in {source}")
 
-        episodes: list[EpisodeRef] = []
+        accepted: list[tuple[Path, dict[str, Any]]] = []
         warnings: list[str] = []
         reference: dict[str, Any] | None = None
+        field_rates: dict[str, float] = {}
         for episode_path in episode_paths:
             try:
                 info = self._inspect_episode(episode_path)
@@ -391,31 +445,39 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
                 warnings.append(f"{episode_path.name}: skipped ({exc})")
                 continue
 
-            episodes.append(
-                EpisodeRef(
-                    key=episode_path.name,
-                    path=str(episode_path),
-                    frame_count=info["frame_count"],
-                    source_bytes=info["source_bytes"],
-                    schema="teleaxis_collector_v3",
-                )
-            )
+            accepted.append((episode_path, info))
+            for field in info["fields"]:
+                field_rates[field.name] = min(field_rates.get(field.name, field.fps), field.fps)
             validation = info["meta"].get("validation")
             status = str(validation.get("status", "")) if isinstance(validation, Mapping) else ""
             if status.upper() not in {"", "PASS", "SKIPPED", "NOT_RUN"}:
                 warnings.append(f"{episode_path.name}: validation status is {status}")
 
-        if not episodes or reference is None:
+        if not accepted or reference is None:
             detail = "; ".join(warnings[:3])
             raise ValueError(f"No complete TeleAxis Collector schema-v3 episodes found. {detail}")
 
+        max_fps = min(field_rates.values())
+        fps = self._desired_fps(max_fps)
+        self.options["fps"] = fps
+        fields = [replace(field, fps=field_rates[field.name]) for field in reference["fields"]]
+        episodes = [
+            EpisodeRef(
+                key=episode_path.name,
+                path=str(episode_path),
+                frame_count=self._trigger_count(info["timeline_start_ns"], info["timeline_end_ns"], fps),
+                source_bytes=info["source_bytes"],
+                schema="teleaxis_collector_v3",
+            )
+            for episode_path, info in accepted
+        ]
         pixels = sum(shape[0] * shape[1] for shape in reference["camera_shapes"].values())
         memory_mb = max(768, min(4096, int(640 + pixels * 10 / (1024 * 1024))))
         return DatasetDescriptor(
             adapter=self.slug,
             source_path=self.source_path,
             episodes=episodes,
-            fps=reference["fps"],
+            fps=fps,
             cameras=reference["cameras"],
             camera_shapes=reference["camera_shapes"],
             state_dim=reference["state_dim"],
@@ -423,69 +485,78 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
             source_bytes=sum(episode.source_bytes for episode in episodes),
             estimated_worker_memory_mb=memory_mb,
             warnings=warnings[:20],
-            fields=reference["fields"],
+            fields=fields,
         )
 
     def iter_frames(self, episode: EpisodeRef) -> Iterator[FrameSample]:
         episode_path = Path(episode.path)
         meta = self._meta(episode_path)
-        state_meta = self._stream_meta(meta, "joint_state", "state")
-        action_meta = self._stream_meta(meta, "joint_action", "action")
-        eef_meta = self._stream_meta(meta, "eef_action", "action")
         cameras = self._camera_names(meta)
-        state_files = self._frame_files(episode_path, state_meta, episode.frame_count)
-        action_files = self._frame_files(episode_path, action_meta, episode.frame_count)
-        eef_files = self._frame_files(episode_path, eef_meta, episode.frame_count)
-        if [path.name for path in action_files] != [path.name for path in state_files]:
-            raise ValueError("joint_action frames do not align with joint_state")
-        if [path.name for path in eef_files] != [path.name for path in state_files]:
-            raise ValueError("eef_action frames do not align with joint_state")
-        episode_index = int(meta["episode_index"])
-        first_monotonic_ns: int | None = None
+        field_names = [
+            "joint_state/qpos",
+            "joint_state/qvel",
+            "joint_state/torque",
+            "joint_action/action",
+            "eef_action/action",
+            *cameras,
+        ]
+        samples = self._load_field_samples(episode_path, meta, field_names)
+        start_ns, end_ns = self._sample_bounds(samples)
+        fps = self._episode_fps(meta)
+        targets = self._trigger_timestamps(start_ns, end_ns, fps)
+        if len(targets) != episode.frame_count:
+            raise ValueError(f"Aligned frame count changed ({len(targets)}/{episode.frame_count})")
+        image_cache: dict[Path, np.ndarray] = {}
 
-        for state_path, action_path, eef_path in zip(
-            state_files, action_files, eef_files, strict=True
-        ):
-            state_record = self._record(state_path, episode_index)
-            action_record = self._record(action_path, episode_index)
-            eef_record = self._record(eef_path, episode_index)
-            qpos = self._vector(state_record, "qpos")
-            joint_action = self._vector(action_record, "action")
-            if qpos.shape != joint_action.shape or not np.array_equal(qpos, joint_action):
-                raise ValueError(f"joint action does not equal qpos in {state_path.name}")
-            images = {
-                camera: self._camera_image(episode_path, meta, state_record, camera)
-                for camera in cameras
+        for frame_index, target_ns in enumerate(targets):
+            values = {
+                name: self._nearest_sample(samples[name], target_ns)
+                for name in field_names
+                if name not in cameras
             }
-            monotonic_ns = self._integer(state_record, "monotonic_timestamp_ns")
-            if first_monotonic_ns is None:
-                first_monotonic_ns = monotonic_ns
-            timestamp = max(0.0, (monotonic_ns - first_monotonic_ns) / 1e9)
+            images: dict[str, np.ndarray] = {}
+            for camera in cameras:
+                image_path = self._nearest_sample(samples[camera], target_ns)
+                if image_path not in image_cache:
+                    image_cache[image_path] = self._decode_camera_image(image_path, meta, camera)
+                images[camera] = image_cache[image_path]
+            values.update(images)
             yield FrameSample(
-                state=qpos,
-                action=joint_action,
+                state=values["joint_state/qpos"],
+                action=values["joint_action/action"],
                 images=images,
-                timestamp=timestamp,
-                fields={
-                    "joint_state/qpos": qpos,
-                    "joint_state/qvel": self._vector(state_record, "qvel"),
-                    "joint_state/torque": self._vector(state_record, "torque"),
-                    "joint_action/action": joint_action,
-                    "eef_action/action": self._vector(eef_record, "action"),
-                    **images,
-                },
+                timestamp=frame_index / fps,
+                fields=values,
             )
+
+    def iter_action_values(
+        self, episode: EpisodeRef, action_fields: Sequence[str]
+    ) -> Iterator[dict[str, Any]]:
+        episode_path = Path(episode.path)
+        meta = self._meta(episode_path)
+        samples = self._load_field_samples(episode_path, meta, action_fields)
+        start_ns, end_ns = self._timeline_bounds(episode_path, meta)
+        fps = self._episode_fps(meta)
+        targets = self._trigger_timestamps(start_ns, end_ns, fps)
+        if len(targets) != episode.frame_count:
+            raise ValueError(f"Aligned action frame count changed ({len(targets)}/{episode.frame_count})")
+        for target_ns in targets:
+            yield {
+                name: self._nearest_sample(samples[name], target_ns)
+                for name in action_fields
+            }
 
     def preview(self, episode: EpisodeRef, camera: str, frame_index: int) -> np.ndarray:
         episode_path = Path(episode.path)
         meta = self._meta(episode_path)
         if camera not in self._camera_names(meta):
             raise KeyError(f"Unknown camera field: {camera}")
-        state_meta = self._stream_meta(meta, "joint_state", "state")
-        state_files = self._frame_files(episode_path, state_meta, episode.frame_count)
-        index = max(0, min(int(frame_index), len(state_files) - 1))
-        record = self._record(state_files[index], int(meta["episode_index"]))
-        return self._camera_image(episode_path, meta, record, camera)
+        samples = self._load_field_samples(episode_path, meta, [camera])
+        start_ns, end_ns = self._timeline_bounds(episode_path, meta)
+        targets = self._trigger_timestamps(start_ns, end_ns, self._episode_fps(meta))
+        index = max(0, min(int(frame_index), len(targets) - 1))
+        image_path = self._nearest_sample(samples[camera], targets[index])
+        return self._decode_camera_image(image_path, meta, camera)
 
     def _inspect_episode(self, episode_path: Path) -> dict[str, Any]:
         meta = self._meta(episode_path)
@@ -505,16 +576,13 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
         state_names = self._field_names(state_meta, "joint_state")
         action_names = self._field_names(action_meta, "joint_action")
         eef_names = self._field_names(eef_meta, "eef_action")
-        state_files = self._frame_files(episode_path, state_meta, frame_count)
-        action_files = self._frame_files(episode_path, action_meta, frame_count)
-        eef_files = self._frame_files(episode_path, eef_meta, frame_count)
-        if [path.name for path in action_files] != [path.name for path in state_files]:
-            raise ValueError("joint_action frames do not align with joint_state")
-        if [path.name for path in eef_files] != [path.name for path in state_files]:
-            raise ValueError("eef_action frames do not align with joint_state")
-        first_state = self._record(state_files[0], int(meta["episode_index"]))
-        first_action = self._record(action_files[0], int(meta["episode_index"]))
-        first_eef = self._record(eef_files[0], int(meta["episode_index"]))
+        state_files = self._timed_files(episode_path, state_meta, "pkl")
+        action_files = self._timed_files(episode_path, action_meta, "pkl")
+        eef_files = self._timed_files(episode_path, eef_meta, "pkl")
+        episode_index = self._integer(meta, "episode_index")
+        first_state = self._record(state_files[0][1], episode_index)
+        first_action = self._record(action_files[0][1], episode_index)
+        first_eef = self._record(eef_files[0][1], episode_index)
         for field_name in ("qpos", "qvel", "torque"):
             if self._vector(first_state, field_name).size != len(state_names):
                 raise ValueError(f"joint_state/{field_name} does not match META order")
@@ -524,29 +592,47 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
             raise ValueError("eef_action/action does not match META order")
 
         cameras = self._camera_names(meta)
-        camera_shapes = {
-            camera: tuple(
-                int(size)
-                for size in self._camera_image(episode_path, meta, first_state, camera).shape
+        camera_files = {
+            camera: self._timed_files(
+                episode_path, self._stream_meta(meta, camera, "camera"), "png"
             )
             for camera in cameras
         }
+        camera_shapes = {
+            camera: tuple(
+                int(size)
+                for size in self._decode_camera_image(paths[0][1], meta, camera).shape
+            )
+            for camera, paths in camera_files.items()
+        }
+        state_fps = self._stream_fps(state_meta)
+        action_fps = self._stream_fps(action_meta)
+        eef_fps = self._stream_fps(eef_meta)
         fields = [
             RawField(
                 "joint_state/qpos",
                 (len(state_names),),
                 default_target="observation.state",
                 names=state_names,
+                fps=state_fps,
             ),
-            RawField("joint_state/qvel", (len(state_names),), names=state_names),
-            RawField("joint_state/torque", (len(state_names),), names=state_names),
+            RawField("joint_state/qvel", (len(state_names),), names=state_names, fps=state_fps),
+            RawField("joint_state/torque", (len(state_names),), names=state_names, fps=state_fps),
             RawField(
                 "joint_action/action",
                 (len(action_names),),
                 default_target="action",
                 names=action_names,
+                is_action=True,
+                fps=action_fps,
             ),
-            RawField("eef_action/action", (len(eef_names),), names=eef_names),
+            RawField(
+                "eef_action/action",
+                (len(eef_names),),
+                names=eef_names,
+                is_action=True,
+                fps=eef_fps,
+            ),
         ]
         streams = meta["streams"]
         for camera in cameras:
@@ -559,19 +645,19 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
                     dtype="uint8",
                     is_image=True,
                     default_target=f"observation.images.{_safe_field_part(camera_name)}",
+                    fps=self._stream_fps(stream),
                 )
             )
 
-        fps_value = state_meta.get("nominal_fps")
-        if isinstance(fps_value, bool):
-            raise ValueError("joint_state nominal_fps is invalid")
-        fps = int(round(float(fps_value)))
-        if fps <= 0:
-            raise ValueError("joint_state nominal_fps must be positive")
+        all_timed_files = [state_files, action_files, eef_files, *camera_files.values()]
+        timeline_start_ns = max(paths[0][0] for paths in all_timed_files)
+        timeline_end_ns = min(paths[-1][0] for paths in all_timed_files)
+        if timeline_end_ns < timeline_start_ns:
+            raise ValueError("sensor streams have no overlapping time range")
         return {
             "meta": meta,
-            "frame_count": frame_count,
-            "fps": fps,
+            "timeline_start_ns": timeline_start_ns,
+            "timeline_end_ns": timeline_end_ns,
             "cameras": cameras,
             "camera_shapes": camera_shapes,
             "state_dim": len(state_names),
@@ -582,8 +668,12 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
 
     @staticmethod
     def _require_matching_layout(reference: dict[str, Any], current: dict[str, Any], path: Path) -> None:
-        keys = ("fps", "cameras", "camera_shapes", "state_dim", "action_dim", "fields")
+        keys = ("cameras", "camera_shapes", "state_dim", "action_dim")
         differences = [key for key in keys if current[key] != reference[key]]
+        reference_fields = [replace(field, fps=0) for field in reference["fields"]]
+        current_fields = [replace(field, fps=0) for field in current["fields"]]
+        if current_fields != reference_fields:
+            differences.append("fields")
         if differences:
             raise ValueError(f"layout differs in {', '.join(differences)}")
 
@@ -624,23 +714,200 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
         return tuple(str(value) for value in order)
 
     @classmethod
-    def _frame_files(
-        cls, episode_path: Path, stream: Mapping[str, Any], expected_count: int
-    ) -> list[Path]:
+    def _timed_files(
+        cls, episode_path: Path, stream: Mapping[str, Any], extension: str
+    ) -> list[tuple[int, Path]]:
         directory = cls._stream_path(episode_path, stream)
-        files = [path for path in directory.iterdir() if path.is_file() and path.suffix == ".pkl"]
+        if not directory.is_dir():
+            raise ValueError(f"stream directory does not exist: {directory}")
+        pattern = {"pkl": cls._FRAME_RE, "png": cls._IMAGE_RE}.get(extension)
+        if pattern is None:
+            raise ValueError(f"unsupported stream extension: {extension}")
+        files = [
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() == f".{extension}"
+        ]
         identities: list[tuple[int, int, Path]] = []
         for path in files:
-            match = cls._FRAME_RE.fullmatch(path.name)
+            match = pattern.fullmatch(path.name)
             if match is None:
                 raise ValueError(f"invalid frame filename {path.name}")
-            identities.append((int(match.group(1)), int(match.group(2)), path))
-        identities.sort(key=lambda item: (item[0], item[1]))
+            identities.append(
+                (int(match.group(1)), int(match.group(2)), cls._within(directory, path))
+            )
+        if not identities:
+            raise ValueError(f"stream contains no {extension.upper()} frames: {directory}")
         indices = [item[0] for item in identities]
-        if indices != list(range(expected_count)):
-            label = str(stream.get("path") or "stream")
-            raise ValueError(f"{label} frame indices are not contiguous ({len(indices)}/{expected_count})")
-        return [item[2] for item in identities]
+        if len(indices) != len(set(indices)):
+            raise ValueError(f"stream contains duplicate frame indices: {directory}")
+        identities.sort(key=lambda item: (item[1], item[0]))
+        return [(timestamp_ns, path) for _, timestamp_ns, path in identities]
+
+    @staticmethod
+    def _stream_fps(stream: Mapping[str, Any]) -> float:
+        for name in ("actual_fps", "nominal_fps"):
+            raw_value = stream.get(name)
+            if raw_value is None or isinstance(raw_value, bool):
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value > 0:
+                return value
+        label = str(stream.get("path") or "stream")
+        raise ValueError(f"{label} must declare a positive actual_fps or nominal_fps")
+
+    def _desired_fps(self, max_fps: float) -> int:
+        if not math.isfinite(max_fps) or max_fps <= 0:
+            raise ValueError("minimum field FPS must be positive")
+        raw_value = self.options.get("fps")
+        if isinstance(raw_value, bool):
+            raise ValueError("target FPS must be a positive integer")
+        unspecified = raw_value is None or raw_value == 0 or (
+            isinstance(raw_value, str) and not raw_value.strip()
+        )
+        if unspecified:
+            fps = math.floor(max_fps + 1e-9)
+        else:
+            try:
+                numeric = float(raw_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("target FPS must be a positive integer") from exc
+            if not math.isfinite(numeric) or not numeric.is_integer():
+                raise ValueError("target FPS must be a positive integer")
+            fps = int(numeric)
+        if fps <= 0:
+            raise ValueError("target FPS must be a positive integer")
+        if fps > max_fps + 1e-9:
+            raise ValueError(
+                f"target FPS {fps} exceeds the minimum field FPS {max_fps:g}"
+            )
+        return fps
+
+    def _episode_fps(self, meta: Mapping[str, Any]) -> int:
+        streams = [
+            self._stream_meta(meta, "joint_state", "state"),
+            self._stream_meta(meta, "joint_action", "action"),
+            self._stream_meta(meta, "eef_action", "action"),
+            *(
+                self._stream_meta(meta, camera, "camera")
+                for camera in self._camera_names(meta)
+            ),
+        ]
+        return self._desired_fps(min(self._stream_fps(stream) for stream in streams))
+
+    @staticmethod
+    def _trigger_count(start_ns: int, end_ns: int, fps: int) -> int:
+        if end_ns < start_ns:
+            raise ValueError("sensor streams have no overlapping time range")
+        if fps <= 0:
+            raise ValueError("target FPS must be positive")
+        return ((end_ns - start_ns) * fps) // 1_000_000_000 + 1
+
+    @classmethod
+    def _trigger_timestamps(cls, start_ns: int, end_ns: int, fps: int) -> list[int]:
+        count = cls._trigger_count(start_ns, end_ns, fps)
+        return [
+            start_ns + round(frame_index * 1_000_000_000 / fps)
+            for frame_index in range(count)
+        ]
+
+    @staticmethod
+    def _sample_bounds(samples: Mapping[str, tuple[list[int], list[Any]]]) -> tuple[int, int]:
+        if not samples:
+            raise ValueError("no sensor fields were selected")
+        start_ns = max(timestamps[0] for timestamps, _ in samples.values())
+        end_ns = min(timestamps[-1] for timestamps, _ in samples.values())
+        if end_ns < start_ns:
+            raise ValueError("sensor streams have no overlapping time range")
+        return start_ns, end_ns
+
+    @staticmethod
+    def _nearest_sample(samples: tuple[list[int], list[Any]], target_ns: int) -> Any:
+        timestamps, values = samples
+        if not timestamps or len(timestamps) != len(values):
+            raise ValueError("sensor sample timestamps and values do not match")
+        position = bisect_left(timestamps, target_ns)
+        if position == 0:
+            return values[0]
+        if position == len(timestamps):
+            return values[-1]
+        before = position - 1
+        if target_ns - timestamps[before] <= timestamps[position] - target_ns:
+            return values[before]
+        return values[position]
+
+    @classmethod
+    def _load_field_samples(
+        cls,
+        episode_path: Path,
+        meta: Mapping[str, Any],
+        field_names: Sequence[str],
+    ) -> dict[str, tuple[list[int], list[Any]]]:
+        requested = list(dict.fromkeys(str(name) for name in field_names))
+        cameras = set(cls._camera_names(meta))
+        unknown = set(requested) - set(cls._NUMERIC_FIELDS) - cameras
+        if unknown:
+            raise ValueError(f"unknown raw fields: {', '.join(sorted(unknown))}")
+
+        output: dict[str, tuple[list[int], list[Any]]] = {}
+        episode_index = cls._integer(meta, "episode_index")
+        grouped: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for field_name in requested:
+            if field_name in cls._NUMERIC_FIELDS:
+                stream_name, stream_type, record_key = cls._NUMERIC_FIELDS[field_name]
+                grouped.setdefault((stream_name, stream_type), []).append(
+                    (field_name, record_key)
+                )
+
+        for (stream_name, stream_type), fields in grouped.items():
+            stream = cls._stream_meta(meta, stream_name, stream_type)
+            timed_files = cls._timed_files(episode_path, stream, "pkl")
+            timestamps = [timestamp_ns for timestamp_ns, _ in timed_files]
+            records = [cls._record(path, episode_index) for _, path in timed_files]
+            expected_size = len(cls._field_names(stream, stream_name))
+            for field_name, record_key in fields:
+                values = [cls._vector(record, record_key) for record in records]
+                if any(value.size != expected_size for value in values):
+                    raise ValueError(f"{field_name} does not match META order")
+                output[field_name] = (timestamps, values)
+
+        for camera in requested:
+            if camera not in cameras:
+                continue
+            timed_files = cls._timed_files(
+                episode_path, cls._stream_meta(meta, camera, "camera"), "png"
+            )
+            output[camera] = (
+                [timestamp_ns for timestamp_ns, _ in timed_files],
+                [path for _, path in timed_files],
+            )
+        return output
+
+    @classmethod
+    def _timeline_bounds(
+        cls, episode_path: Path, meta: Mapping[str, Any]
+    ) -> tuple[int, int]:
+        streams = [
+            (cls._stream_meta(meta, "joint_state", "state"), "pkl"),
+            (cls._stream_meta(meta, "joint_action", "action"), "pkl"),
+            (cls._stream_meta(meta, "eef_action", "action"), "pkl"),
+            *(
+                (cls._stream_meta(meta, camera, "camera"), "png")
+                for camera in cls._camera_names(meta)
+            ),
+        ]
+        timed_streams = [
+            cls._timed_files(episode_path, stream, extension)
+            for stream, extension in streams
+        ]
+        start_ns = max(paths[0][0] for paths in timed_streams)
+        end_ns = min(paths[-1][0] for paths in timed_streams)
+        if end_ns < start_ns:
+            raise ValueError("sensor streams have no overlapping time range")
+        return start_ns, end_ns
 
     @staticmethod
     def _stream_path(episode_path: Path, stream: Mapping[str, Any]) -> Path:
@@ -698,23 +965,10 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
         return cameras
 
     @classmethod
-    def _camera_image(
-        cls,
-        episode_path: Path,
-        meta: Mapping[str, Any],
-        state_record: Mapping[str, Any],
-        camera: str,
+    def _decode_camera_image(
+        cls, image_path: Path, meta: Mapping[str, Any], camera: str
     ) -> np.ndarray:
-        cameras = state_record.get("cameras")
-        value = cameras.get(camera) if isinstance(cameras, Mapping) else None
-        if not isinstance(value, Mapping):
-            raise ValueError(f"joint_state is missing camera {camera}")
-        image_value = value.get("image_path")
-        if not isinstance(image_value, str) or not image_value:
-            raise ValueError(f"camera {camera} image_path is missing")
         stream = cls._stream_meta(meta, camera, "camera")
-        camera_dir = cls._stream_path(episode_path, stream)
-        image_path = cls._within(camera_dir, episode_path / image_value)
         decoded = decode_image(image_path.read_bytes())
         if decoded is None:
             raise ValueError(f"could not decode camera image {image_path}")

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain LeRobot Converter"
+  short_description: "Safely modify the LeRobot conversion workbench"
+  default_prompt: "Use $maintain-lerobot-converter to make a safe, tested change to this repository."

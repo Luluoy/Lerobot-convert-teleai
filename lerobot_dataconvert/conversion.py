@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from functools import partial
 from pathlib import Path
 import copy
 import ctypes
@@ -10,6 +11,7 @@ import os
 import resource
 import shutil
 import signal
+import sys
 import tempfile
 import time
 import traceback
@@ -20,6 +22,7 @@ import numpy as np
 
 from .adapters import create_adapter
 from .models import DatasetDescriptor, EpisodeRef, JobConfig
+from .motion import analyze_episode_motion
 
 
 SUPPORTED_REVISIONS = (
@@ -95,7 +98,11 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
         descriptor = DatasetDescriptor.from_dict(payload["descriptor"])
         episodes = [EpisodeRef.from_dict(item) for item in payload["episodes"]]
         source_indices = payload["source_indices"]
-        adapter = create_adapter(config.adapter, config.source_path, config.adapter_options)
+        adapter = create_adapter(
+            config.adapter,
+            config.source_path,
+            {**config.adapter_options, "fps": config.fps},
+        )
 
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -119,12 +126,48 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
             None,
         )
         total_frames = 0
+        processed_frames = 0
+        removed_segments = 0
         episode_lengths: list[int] = []
         source_records: list[dict[str, Any]] = []
         try:
             for local_episode_index, (source_index, episode) in enumerate(zip(source_indices, episodes, strict=True)):
                 episode_frames = 0
-                for sample in adapter.iter_frames(episode):
+                motion_result = None
+                if config.trim_stationary_start or config.remove_stationary_segments:
+                    motion_result = analyze_episode_motion(
+                        adapter,
+                        descriptor,
+                        episode,
+                        config.trim_stationary_start,
+                        config.remove_stationary_segments,
+                        config.stationary_frames,
+                    )
+                    removed_segments += len(motion_result["segments"])
+                drop_ranges = motion_result["segments"] if motion_result else []
+                drop_index = 0
+                processed_episode_frames = 0
+                for frame_index, sample in enumerate(adapter.iter_frames(episode)):
+                    processed_episode_frames += 1
+                    processed_frames += 1
+                    if processed_frames % 10 == 0:
+                        result_queue.put(
+                            {
+                                "type": "progress",
+                                "segment_id": segment_id,
+                                "frames": total_frames,
+                                "processed_frames": processed_frames,
+                                "episode": source_index,
+                            }
+                        )
+                    while drop_index < len(drop_ranges) and frame_index >= drop_ranges[drop_index]["end"]:
+                        drop_index += 1
+                    if (
+                        drop_index < len(drop_ranges)
+                        and drop_ranges[drop_index]["start"] <= frame_index < drop_ranges[drop_index]["end"]
+                    ):
+                        continue
+
                     values = sample.as_fields()
                     if state_source is not None and state_source not in values:
                         raise ValueError(f"Missing mapped field {state_source} in {episode.path}")
@@ -165,19 +208,16 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
                     dataset.add_frame(frame, config.task_instruction)
                     episode_frames += 1
                     total_frames += 1
-                    if total_frames % 10 == 0:
-                        result_queue.put(
-                            {
-                                "type": "progress",
-                                "segment_id": segment_id,
-                                "frames": total_frames,
-                                "episode": source_index,
-                            }
-                        )
+
+                if processed_episode_frames != episode.frame_count:
+                    raise ValueError(
+                        f"Frame iteration produced {processed_episode_frames} frames; "
+                        f"expected {episode.frame_count} in {episode.path}"
+                    )
 
                 if episode_frames <= 0:
                     raise ValueError(f"Episode produced no valid frames: {episode.path}")
-                dataset.save_episode()
+                _save_episode(dataset, config.video_crf)
                 episode_lengths.append(episode_frames)
                 source_records.append(
                     {
@@ -186,6 +226,8 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
                         "source_key": episode.key,
                         "source_path": episode.path,
                         "length": episode_frames,
+                        "source_length": processed_episode_frames,
+                        "removed_frames": processed_episode_frames - episode_frames,
                     }
                 )
         finally:
@@ -196,6 +238,9 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
             "segment_id": segment_id,
             "episodes": len(episode_lengths),
             "frames": total_frames,
+            "processed_frames": processed_frames,
+            "removed_frames": processed_frames - total_frames,
+            "removed_segments": removed_segments,
             "episode_lengths": episode_lengths,
             "source_indices": source_indices,
             "bytes": directory_size(output_dir),
@@ -672,6 +717,17 @@ def _close_dataset(dataset: Any) -> None:
         dataset._wait_image_writer()
     if getattr(dataset, "image_writer", None) is not None and hasattr(dataset, "stop_image_writer"):
         dataset.stop_image_writer()
+
+
+def _save_episode(dataset: Any, video_crf: int) -> None:
+    # LeRobot 0.3.3 does not expose encoder options through save_episode().
+    dataset_module = sys.modules[dataset.__class__.__module__]
+    encoder = dataset_module.encode_video_frames
+    dataset_module.encode_video_frames = partial(encoder, crf=video_crf)
+    try:
+        dataset.save_episode()
+    finally:
+        dataset_module.encode_video_frames = encoder
 
 
 def _dimension_names(names: list[str], dimension: int, prefix: str) -> list[str]:

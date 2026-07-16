@@ -12,6 +12,7 @@ const state = {
   installPrompt: null,
   previewTimer: null,
   pollBusy: false,
+  bootstrapBusy: false,
   lastOutputSegmentCount: -1,
 };
 
@@ -25,6 +26,14 @@ const statusLabels = {
   failed: "失败",
   canceled: "已取消",
 };
+
+function invalidateInspection() {
+  state.descriptor = null;
+  $("#createJobButton").disabled = true;
+  $("#motionActionFields").hidden = true;
+  clearMotionScan();
+  updateMotionControls();
+}
 
 async function request(path, options = {}, expectBlob = false) {
   const init = { ...options, headers: { ...(options.headers || {}) } };
@@ -51,6 +60,7 @@ async function bootstrap() {
   configureResources(data.hardware);
   renderJobs();
   restorePreferences();
+  updateMotionControls();
   if (state.jobs.length) selectJob(state.jobs[0].id, false);
   window.lucide?.createIcons();
 }
@@ -77,6 +87,9 @@ function renderAdapterOptions() {
     input.value = option.default ?? "";
     if (option.min != null) input.min = option.min;
     if (option.max != null) input.max = option.max;
+    if (option.step != null) input.step = option.step;
+    if (option.placeholder) input.placeholder = option.placeholder;
+    input.addEventListener("change", invalidateInspection);
     root.append(label, input);
   }
 }
@@ -109,6 +122,76 @@ function configureResources(hardware) {
   updateResourceOutputs();
 }
 
+function declaredActionFields(descriptor) {
+  return descriptorFields(descriptor).filter((field) => field.is_action || field.default_target === "action");
+}
+
+function motionRules() {
+  return {
+    trim_stationary_start: $("#trimStationaryStart").checked,
+    remove_stationary_segments: $("#removeStationarySegments").checked,
+    stationary_frames: Number($("#stationaryFrames").value),
+  };
+}
+
+function clearMotionScan() {
+  const readout = $("#motionScanReadout");
+  readout.hidden = true;
+  readout.replaceChildren();
+}
+
+function configureMotionFields(descriptor) {
+  const fields = declaredActionFields(descriptor);
+  const readout = $("#motionActionFields");
+  readout.hidden = false;
+  readout.querySelector("strong").textContent = fields.length ? fields.map((field) => field.name).join(" + ") : "未声明";
+  clearMotionScan();
+  updateMotionControls();
+}
+
+function updateMotionControls() {
+  const removeSegments = $("#removeStationarySegments").checked;
+  $("#stationaryFrames").disabled = !removeSegments;
+  $("#stationaryFramesField").classList.toggle("disabled", !removeSegments);
+  const fps = Number(state.descriptor?.fps || adapterOptions().fps || 20);
+  const frames = Number($("#stationaryFrames").value);
+  $("#stationaryFramesOutput").textContent = `${frames} FR / ${formatNumber(frames / fps, 2)} s`;
+  const hasActions = state.descriptor && declaredActionFields(state.descriptor).length > 0;
+  $("#motionScanButton").disabled = !hasActions || (!$("#trimStationaryStart").checked && !removeSegments);
+}
+
+async function scanMotion() {
+  if (!state.descriptor) return toast("MOTION", "请先扫描原始数据");
+  const button = $("#motionScanButton");
+  button.disabled = true;
+  button.querySelector("span").textContent = "扫描中";
+  try {
+    const result = await request("/api/motion-scan", {
+      method: "POST",
+      body: {
+        adapter: $("#adapterSelect").value,
+        source_path: $("#sourcePath").value,
+        adapter_options: adapterOptions(),
+        ...motionRules(),
+      },
+    });
+    const readout = $("#motionScanReadout");
+    readout.hidden = false;
+    readout.innerHTML = `<dl>
+      <dt>SEGMENTS</dt><dd>${formatInteger(result.segments)}</dd>
+      <dt>START SEG</dt><dd>${formatInteger(result.leading_segments)}</dd>
+      <dt>STILL SEG</dt><dd>${formatInteger(result.stationary_segments)}</dd>
+      <dt>REMOVED</dt><dd>${formatInteger(result.removed_frames)} / ${formatInteger(result.source_frames)} FR</dd>
+      <dt>TIME</dt><dd>${formatNumber(result.removed_seconds, 2)} s</dd>
+      <dt>KEPT</dt><dd>${formatInteger(result.kept_frames)} FR</dd>
+    </dl>`;
+    savePreferences();
+  } finally {
+    button.querySelector("span").textContent = "预扫描";
+    updateMotionControls();
+  }
+}
+
 function adapterOptions() {
   const output = {};
   $$('[data-adapter-option]').forEach((input) => {
@@ -132,7 +215,13 @@ async function inspectSource() {
     });
     state.descriptor = descriptor;
     state.previewDescriptor = descriptor;
+    const fpsInput = $('[data-adapter-option="fps"]');
+    if (fpsInput) {
+      fpsInput.max = String(Math.max(1, Math.floor(Number(descriptor.max_output_fps || descriptor.fps) + 1e-9)));
+      fpsInput.value = String(descriptor.fps);
+    }
     renderDescriptor(descriptor);
+    configureMotionFields(descriptor);
     $("#createJobButton").disabled = false;
     if (!$("#repoId").value) $("#repoId").value = basename($("#outputPath").value) || basename(descriptor.source_path);
     configurePreview(descriptor, null);
@@ -147,6 +236,7 @@ async function inspectSource() {
 function renderDescriptor(descriptor) {
   const fields = descriptorFields(descriptor);
   const imageCount = fields.filter((field) => field.is_image).length;
+  const actionCount = declaredActionFields(descriptor).length;
   const readout = $("#datasetReadout");
   readout.hidden = false;
   readout.innerHTML = `<dl>
@@ -154,7 +244,9 @@ function renderDescriptor(descriptor) {
     <dt>FRAMES</dt><dd>${formatInteger(descriptor.total_frames)}</dd>
     <dt>CAMERAS</dt><dd>${descriptor.cameras.length}</dd>
     <dt>FIELDS / IMG</dt><dd>${fields.length} / ${imageCount}</dd>
+    <dt>ACTION FIELDS</dt><dd>${actionCount}</dd>
     <dt>STATE / ACTION</dt><dd>${descriptor.state_dim} / ${descriptor.action_dim}</dd>
+    <dt>OUTPUT / MAX FPS</dt><dd>${formatNumber(descriptor.fps, 0)} / ${formatNumber(descriptor.max_output_fps || descriptor.fps, 2)}</dd>
     <dt>SOURCE</dt><dd>${formatBytes(descriptor.source_bytes)}</dd>
     <dt>WORKER EST.</dt><dd>${formatInteger(descriptor.estimated_worker_memory_mb)} MiB</dd>
   </dl>${descriptor.warnings.length ? `<p>${escapeHtml(descriptor.warnings[0])}</p>` : ""}`;
@@ -173,7 +265,7 @@ function renderDescriptor(descriptor) {
     <datalist id="lerobotFieldTargets">${targetSuggestions.map((target) => `<option value="${escapeHtml(target)}"></option>`).join("")}</datalist>
     <div class="field-map-head"><span>RAW FIELD</span><span></span><span>LEROBOT FIELD</span></div>
     ${fields.map((field) => `<div class="field-map-row">
-      <div class="field-source" title="${escapeHtml(field.name)}"><strong>${escapeHtml(field.name)}</strong><span>${field.is_image ? "IMG" : field.dtype.toUpperCase()} / ${(field.shape || []).join("x")}</span></div>
+      <div class="field-source" title="${escapeHtml(field.name)}"><strong>${escapeHtml(field.name)}</strong><span>${field.is_image ? "IMG" : field.is_action ? "ACT" : field.dtype.toUpperCase()} / ${(field.shape || []).join("x")} / ${formatNumber(field.fps || descriptor.fps, 2)} FPS</span></div>
       <i data-lucide="arrow-right"></i>
       <input type="text" data-field-source="${escapeHtml(field.name)}" list="lerobotFieldTargets" value="${escapeHtml(field.default_target || "")}" placeholder="IGNORE" aria-label="${escapeHtml(field.name)} LeRobot 目标字段">
     </div>`).join("")}
@@ -205,13 +297,15 @@ async function createJob(event) {
       task_instruction: $("#taskInstruction").value,
       fps: Number(adapterOptions().fps || state.descriptor.fps),
       cpu_cores: Number($("#cpuCores").value),
+      cpu_limit_percent: Number($("#cpuLimitPercent").value),
       memory_gb: Number($("#memoryGb").value),
       segment_size: Number($("#segmentSize").value),
+      video_crf: Number($("#videoCrf").value),
+      ...motionRules(),
       field_mapping: fieldMapping,
       state_names: splitNames($("#stateNames")?.value),
       action_names: splitNames($("#actionNames")?.value),
       adapter_options: adapterOptions(),
-      skip_zero_state: $("#skipZeroState").checked,
       overwrite: $("#overwriteOutput").checked,
     };
     const job = await request("/api/jobs", { method: "POST", body: payload });
@@ -234,11 +328,12 @@ async function resumeFromPath() {
 }
 
 async function refreshJobs() {
-  if (state.pollBusy) return;
+  if (state.pollBusy) return $("#backendNotice").hidden;
   state.pollBusy = true;
   try {
     const data = await request("/api/jobs");
     state.jobs = data.jobs;
+    setConnection(true);
     renderJobs();
     if (state.selectedJobId) {
       const job = selectedJob();
@@ -250,8 +345,10 @@ async function refreshJobs() {
         }
       }
     }
+    return true;
   } catch (_) {
     setConnection(false);
+    return false;
   } finally {
     state.pollBusy = false;
   }
@@ -273,14 +370,17 @@ function renderJobs() {
     const progress = Math.round((job.progress || 0) * 100);
     const canStop = ["queued", "running", "merging"].includes(job.state);
     const canResume = ["paused", "failed"].includes(job.state);
+    const canDelete = !["queued", "running", "merging", "stopping"].includes(job.state);
     row.innerHTML = `
       <td><strong class="job-name">${escapeHtml(job.name)}</strong><span class="job-path">${escapeHtml(job.config.output_path)}</span></td>
       <td><span class="state-label">${statusLabels[job.state] || escapeHtml(job.state)}</span></td>
       <td><div class="row-progress"><div class="row-progress-track"><span style="width:${progress}%"></span></div><output>${progress}%</output></div></td>
       <td>${formatFinish(job.eta_seconds, job.state)}</td>
       <td>${formatBytes(job.estimated_output_bytes)}</td>
-      <td><div class="job-actions">${canStop ? actionButton("square", "stop", "中断任务") : ""}${canResume ? actionButton("play", "resume", "继续任务") : ""}</div></td>`;
-    row.addEventListener("click", () => selectJob(job.id));
+      <td><div class="job-actions">${canStop ? actionButton("square", "stop", "中断任务") : ""}${canResume ? actionButton("play", "resume", "继续任务") : ""}${canDelete ? actionButton("trash-2", "delete", "从列表删除（保留本地文件）") : ""}</div></td>`;
+    row.addEventListener("click", (event) => {
+      if (!event.target.closest("[data-job-action]")) selectJob(job.id);
+    });
     body.append(row);
   }
   window.lucide?.createIcons();
@@ -295,9 +395,21 @@ async function handleJobAction(event) {
   if (!button) return;
   event.stopPropagation();
   const jobId = button.closest("tr").dataset.jobId;
+  const action = button.dataset.jobAction;
   button.disabled = true;
   try {
-    await request(`/api/jobs/${jobId}/${button.dataset.jobAction}`, { method: "POST", body: {} });
+    if (action === "delete") {
+      await request(`/api/jobs/${jobId}`, { method: "DELETE" });
+      if (state.selectedJobId === jobId) {
+        state.selectedJobId = null;
+        state.previewDescriptor = null;
+        $("#detailBand").hidden = true;
+        $("#previewBand").hidden = true;
+      }
+      toast("REMOVED", "任务已从列表移除，本地文件未更改");
+    } else {
+      await request(`/api/jobs/${jobId}/${action}`, { method: "POST", body: {} });
+    }
     await refreshJobs();
   } finally {
     button.disabled = false;
@@ -325,7 +437,7 @@ function selectJob(jobId, reload = true) {
 
 function renderDetail(job) {
   $("#detailBand").hidden = false;
-  $("#detailState").textContent = `${statusLabels[job.state] || job.state} / ${job.config.revision}`;
+  $("#detailState").textContent = `${statusLabels[job.state] || job.state} / ${job.config.revision} / CRF ${job.config.video_crf ?? 30} / CPU MAX ${job.config.cpu_limit_percent ?? 95}%`;
   $("#detailName").textContent = job.name;
   $("#detailPath").textContent = job.config.output_path;
   const percent = Math.round((job.progress || 0) * 100);
@@ -481,8 +593,11 @@ function choosePickerValue(value) {
 
 function updateResourceOutputs() {
   $("#cpuOutput").textContent = `${$("#cpuCores").value} CORE`;
+  $("#cpuLimitOutput").textContent = `${$("#cpuLimitPercent").value}% MAX`;
   $("#memoryOutput").textContent = `${$("#memoryGb").value} GiB`;
   $("#segmentOutput").textContent = `${$("#segmentSize").value} EP`;
+  $("#videoCrfOutput").textContent = `CRF ${$("#videoCrf").value}`;
+  updateMotionControls();
 }
 
 function savePreferences() {
@@ -493,8 +608,13 @@ function savePreferences() {
     robot_type: $("#robotType").value,
     task_instruction: $("#taskInstruction").value,
     cpu_cores: $("#cpuCores").value,
+    cpu_limit_percent: $("#cpuLimitPercent").value,
     memory_gb: $("#memoryGb").value,
     segment_size: $("#segmentSize").value,
+    video_crf: $("#videoCrf").value,
+    trim_stationary_start: $("#trimStationaryStart").checked,
+    remove_stationary_segments: $("#removeStationarySegments").checked,
+    stationary_frames: $("#stationaryFrames").value,
   }));
 }
 
@@ -504,7 +624,8 @@ function restorePreferences() {
     if (!saved) return;
     for (const [key, value] of Object.entries(saved)) {
       const input = $(`#${camelId(key)}`);
-      if (input && value != null) input.value = value;
+      if (input?.type === "checkbox") input.checked = Boolean(value);
+      else if (input && value != null) input.value = value;
     }
     updateResourceOutputs();
   } catch (_) { /* ignore invalid local preference data */ }
@@ -515,13 +636,14 @@ function splitNames(value = "") { return value.split(/[,\n]/).map((item) => item
 function descriptorFields(descriptor) {
   if (descriptor?.fields?.length) return descriptor.fields;
   return [
-    { name: "state", shape: [descriptor.state_dim], dtype: "float32", is_image: false, default_target: "observation.state" },
-    { name: "action", shape: [descriptor.action_dim], dtype: "float32", is_image: false, default_target: "action" },
+    { name: "state", shape: [descriptor.state_dim], dtype: "float32", is_image: false, default_target: "observation.state", fps: descriptor.fps },
+    { name: "action", shape: [descriptor.action_dim], dtype: "float32", is_image: false, is_action: true, default_target: "action", fps: descriptor.fps },
     ...descriptor.cameras.map((camera) => ({
       name: camera,
       shape: descriptor.camera_shapes[camera],
       dtype: "uint8",
       is_image: true,
+      fps: descriptor.fps,
       default_target: `observation.images.${defaultCameraName(camera)}`,
     })),
   ];
@@ -565,17 +687,50 @@ function setConnection(online) {
   const node = $("#connectionState");
   node.classList.toggle("offline", !online);
   node.lastChild.textContent = online ? "LOCAL" : "OFFLINE";
+  $("#backendNotice").hidden = online;
+}
+
+async function initializeBackend(showFailure = false) {
+  if (state.bootstrap) return true;
+  if (state.bootstrapBusy) return false;
+  state.bootstrapBusy = true;
+  try {
+    await bootstrap();
+    setConnection(true);
+    return true;
+  } catch (error) {
+    setConnection(false);
+    if (showFailure) toast("SERVER", error.message);
+    return false;
+  } finally {
+    state.bootstrapBusy = false;
+  }
+}
+
+async function checkBackend() {
+  const button = $("#backendRetry");
+  button.disabled = true;
+  try {
+    const online = state.bootstrap ? await refreshJobs() : await initializeBackend(true);
+    if (!online && state.bootstrap) toast("SERVER", "后端仍不可用，请检查或重启服务");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function bindEvents() {
-  $("#adapterSelect").addEventListener("change", () => { renderAdapterOptions(); state.descriptor = null; $("#createJobButton").disabled = true; });
-  $("#sourcePath").addEventListener("change", () => { state.descriptor = null; $("#createJobButton").disabled = true; });
+  $("#adapterSelect").addEventListener("change", () => { renderAdapterOptions(); invalidateInspection(); });
+  $("#sourcePath").addEventListener("change", invalidateInspection);
   $("#inspectButton").addEventListener("click", () => inspectSource().catch((error) => toast("SCAN FAILED", error.message)));
+  $("#motionScanButton").addEventListener("click", () => scanMotion().catch((error) => toast("MOTION SCAN", error.message)));
   $("#jobForm").addEventListener("submit", (event) => createJob(event).catch((error) => toast("CREATE FAILED", error.message)));
   $("#resumePathButton").addEventListener("click", () => resumeFromPath().catch((error) => toast("RECOVERY FAILED", error.message)));
-  $("#refreshButton").addEventListener("click", () => refreshJobs());
+  $("#refreshButton").addEventListener("click", () => state.bootstrap ? refreshJobs() : initializeBackend(true));
+  $("#backendRetry").addEventListener("click", () => checkBackend());
   $("#jobsBody").addEventListener("click", (event) => handleJobAction(event).catch((error) => toast("TASK", error.message)));
-  ["#cpuCores", "#memoryGb", "#segmentSize"].forEach((selector) => $(selector).addEventListener("input", updateResourceOutputs));
+  ["#cpuCores", "#cpuLimitPercent", "#memoryGb", "#segmentSize", "#videoCrf"].forEach((selector) => $(selector).addEventListener("input", updateResourceOutputs));
+  ["#trimStationaryStart", "#removeStationarySegments"].forEach((selector) => $(selector).addEventListener("change", () => { clearMotionScan(); updateMotionControls(); }));
+  $("#stationaryFrames").addEventListener("input", () => { clearMotionScan(); updateMotionControls(); });
   $$('[data-browse]').forEach((button) => button.addEventListener("click", () => openPicker(button.dataset.browse).catch((error) => toast("PATH", error.message))));
   $("#directoryUp").addEventListener("click", async () => renderDirectory(await request(`/api/fs?path=${encodeURIComponent($("#directoryUp").dataset.path)}`)));
   $("#selectDirectory").addEventListener("click", () => choosePickerValue(state.pickerPath));
@@ -583,18 +738,15 @@ function bindEvents() {
   $("#frameSlider").addEventListener("input", () => { updateTimelineOutputs(); schedulePreview(); });
   $("#previewCamera").addEventListener("change", schedulePreview);
   $("#reloadPreview").addEventListener("click", () => loadPreview());
-  window.addEventListener("online", () => { setConnection(true); refreshJobs(); });
+  window.addEventListener("online", () => state.bootstrap ? refreshJobs() : initializeBackend());
   window.addEventListener("offline", () => setConnection(false));
   window.addEventListener("beforeinstallprompt", (event) => { event.preventDefault(); state.installPrompt = event; $("#installButton").hidden = false; });
   $("#installButton").addEventListener("click", async () => { if (state.installPrompt) await state.installPrompt.prompt(); });
 }
 
 bindEvents();
-bootstrap().then(() => {
-  setConnection(true);
-  setInterval(refreshJobs, 1000);
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
-}).catch((error) => {
-  setConnection(false);
-  toast("SERVER", error.message);
-});
+window.lucide?.createIcons();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
+initializeBackend();
+setInterval(() => { if (state.bootstrap) refreshJobs(); }, 1000);
+setInterval(() => { if (!state.bootstrap) initializeBackend(); }, 3000);

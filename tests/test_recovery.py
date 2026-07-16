@@ -23,6 +23,37 @@ def wait_for(manager: JobManager, job_id: str, states: set[str], timeout: float 
 
 
 class RecoveryTest(unittest.TestCase):
+    def test_list_deletion_preserves_source_output_and_cache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lerobot-delete-test-") as temporary:
+            root = Path(temporary)
+            source_file = root / "raw" / "episode.bin"
+            output_file = root / "output" / "meta" / "info.json"
+            cache_file = root / ".output.lerobot-cache" / "manifest.json"
+            for path, content in (
+                (source_file, b"source"),
+                (output_file, b"output"),
+                (cache_file, b"cache"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+
+            manager = JobManager(root / "state")
+            manager.store.insert(
+                {
+                    "id": "completed-job",
+                    "state": "completed",
+                    "cache_dir": str(cache_file.parent),
+                    "created_at": 1.0,
+                    "updated_at": 1.0,
+                }
+            )
+            manager.delete_job("completed-job")
+            self.assertIsNone(manager.store.get("completed-job"))
+            self.assertEqual(source_file.read_bytes(), b"source")
+            self.assertEqual(output_file.read_bytes(), b"output")
+            self.assertEqual(cache_file.read_bytes(), b"cache")
+            manager.shutdown()
+
     def test_interrupted_cache_is_recovered_automatically(self) -> None:
         with tempfile.TemporaryDirectory(prefix="lerobot-recovery-test-") as temporary:
             root = Path(temporary)
@@ -41,7 +72,7 @@ class RecoveryTest(unittest.TestCase):
                 "fps": 20,
                 "cpu_cores": 2,
                 "memory_gb": 4,
-                "segment_size": 1,
+                "segment_size": 2,
                 "camera_names": {"camera_0": "head", "camera_1": "wrist"},
                 "state_names": [f"joint_{index}" for index in range(4)],
                 "action_names": [f"joint_{index}" for index in range(4)],
@@ -51,6 +82,14 @@ class RecoveryTest(unittest.TestCase):
 
             manager = JobManager(state_dir)
             job = manager.create_job(payload)
+            initial_manifest = json.loads(
+                (Path(job["cache_dir"]) / "manifest.json").read_text()
+            )
+            task_lists = [segment["source_indices"] for segment in initial_manifest["segments"]]
+            assigned = [index for task_list in task_lists for index in task_list]
+            self.assertEqual(task_lists, [[0, 1], [2, 3]])
+            self.assertEqual(assigned, list(range(4)))
+            self.assertEqual(len(assigned), len(set(assigned)))
             wait_for(manager, job["id"], {"running", "merging", "completed"})
             if manager.store.get(job["id"])["state"] != "completed":
                 manager.stop_job(job["id"])
