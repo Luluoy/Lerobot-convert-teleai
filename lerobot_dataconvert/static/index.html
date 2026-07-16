@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0B0C0A">
+  <meta name="color-scheme" content="dark">
+  <title>LeRobot Data Convert</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/app-icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/app-icon-192.png">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block" aria-label="LeRobot Data Convert">
+      <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+      <div>
+        <h1>LEROBOT DATA CONVERT</h1>
+        <p id="runtimeLabel">LOCAL WORKBENCH</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span class="connection" id="connectionState"><span></span>LOCAL</span>
+      <button class="icon-button" id="installButton" type="button" aria-label="安装应用" title="安装应用" hidden>
+        <i data-lucide="download"></i>
+      </button>
+      <button class="icon-button" id="refreshButton" type="button" aria-label="刷新任务" title="刷新任务">
+        <i data-lucide="refresh-cw"></i>
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="control-rail" aria-label="转换设置">
+      <form id="jobForm">
+        <section class="rail-section">
+          <div class="section-title"><span>01</span><h2>原始数据</h2></div>
+          <label class="field-label" for="adapterSelect">加载器</label>
+          <select id="adapterSelect" name="adapter"></select>
+
+          <label class="field-label" for="sourcePath">数据路径</label>
+          <div class="field-with-button">
+            <input id="sourcePath" name="source_path" type="text" autocomplete="off" placeholder="/path/to/raw-dataset" required>
+            <button class="icon-button field-button" type="button" data-browse="sourcePath" aria-label="浏览原始数据路径" title="浏览">
+              <i data-lucide="folder-open"></i>
+            </button>
+          </div>
+          <div id="adapterOptions"></div>
+          <button class="secondary-command" id="inspectButton" type="button">
+            <i data-lucide="scan-search"></i><span>扫描数据</span>
+          </button>
+          <div class="dataset-readout" id="datasetReadout" hidden></div>
+        </section>
+
+        <section class="rail-section">
+          <div class="section-title"><span>02</span><h2>目标数据</h2></div>
+          <label class="field-label" for="outputPath">保存路径</label>
+          <div class="field-with-button">
+            <input id="outputPath" name="output_path" type="text" autocomplete="off" placeholder="/path/to/lerobot-dataset" required>
+            <button class="icon-button field-button" type="button" data-browse="outputPath" aria-label="浏览保存路径" title="浏览">
+              <i data-lucide="folder-open"></i>
+            </button>
+          </div>
+          <button class="text-command resume-path" id="resumePathButton" type="button">
+            <i data-lucide="history"></i><span>从此路径恢复</span>
+          </button>
+
+          <div class="two-fields">
+            <div>
+              <label class="field-label" for="repoId">Repo ID</label>
+              <input id="repoId" name="repo_id" type="text" placeholder="dataset-name">
+            </div>
+            <div>
+              <label class="field-label" for="robotType">Robot type</label>
+              <input id="robotType" name="robot_type" type="text" value="acone">
+            </div>
+          </div>
+
+          <span class="field-label">Revision</span>
+          <div class="segmented" id="revisionControl" role="radiogroup" aria-label="LeRobot revision"></div>
+
+          <label class="field-label" for="taskInstruction">Task instruction</label>
+          <textarea id="taskInstruction" name="task_instruction" rows="3" required></textarea>
+
+          <div id="cameraMapping" class="camera-mapping" hidden></div>
+        </section>
+
+        <section class="rail-section resources-section">
+          <div class="section-title"><span>03</span><h2>资源限制</h2></div>
+          <div class="range-field">
+            <div><label for="cpuCores">CPU 核心</label><output id="cpuOutput" for="cpuCores">--</output></div>
+            <input id="cpuCores" name="cpu_cores" type="range" min="1" max="1" value="1">
+          </div>
+          <div class="range-field">
+            <div><label for="memoryGb">内存预算</label><output id="memoryOutput" for="memoryGb">--</output></div>
+            <input id="memoryGb" name="memory_gb" type="range" min="1" max="2" step="0.5" value="2">
+          </div>
+          <div class="range-field">
+            <div><label for="segmentSize">恢复段大小</label><output id="segmentOutput" for="segmentSize">2 EP</output></div>
+            <input id="segmentSize" name="segment_size" type="range" min="1" max="8" value="2">
+          </div>
+          <div class="toggle-row">
+            <label><input id="skipZeroState" type="checkbox" checked><span>跳过全零 state</span></label>
+            <label><input id="overwriteOutput" type="checkbox"><span>覆盖已有输出</span></label>
+          </div>
+        </section>
+
+        <div class="rail-actions">
+          <button class="primary-command" id="createJobButton" type="submit" disabled>
+            <i data-lucide="play"></i><span>开始转换</span>
+          </button>
+        </div>
+      </form>
+    </aside>
+
+    <div class="main-stage">
+      <section class="system-strip" aria-label="任务统计">
+        <div><span>ACTIVE</span><strong id="activeJobs">0</strong></div>
+        <div><span>QUEUED</span><strong id="queuedJobs">0</strong></div>
+        <div><span>DONE</span><strong id="doneJobs">0</strong></div>
+        <div><span>CPU LIMIT</span><strong id="globalCpu">--</strong></div>
+        <div><span>MEM AVAILABLE</span><strong id="globalMemory">--</strong></div>
+      </section>
+
+      <section class="jobs-band">
+        <div class="band-heading">
+          <div><span class="band-index">A</span><h2>转换任务</h2></div>
+          <span id="jobCount">0 TASKS</span>
+        </div>
+        <div class="table-wrap">
+          <table class="jobs-table">
+            <thead>
+              <tr><th>任务</th><th>状态</th><th>进度</th><th>预计完成</th><th>预计大小</th><th><span class="sr-only">操作</span></th></tr>
+            </thead>
+            <tbody id="jobsBody"></tbody>
+          </table>
+          <div class="empty-state" id="jobsEmpty">
+            <i data-lucide="list-plus"></i><span>暂无转换任务</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="detail-band" id="detailBand" hidden>
+        <div class="detail-identity">
+          <div>
+            <span class="band-index">B</span>
+            <p id="detailState">--</p>
+            <h2 id="detailName">--</h2>
+            <span id="detailPath">--</span>
+          </div>
+          <strong id="detailPercent">0<span>%</span></strong>
+        </div>
+        <div class="pixel-progress" aria-label="任务进度"><span id="detailProgress"></span></div>
+        <div class="detail-metrics">
+          <div><span>EPISODES</span><strong id="metricEpisodes">--</strong></div>
+          <div><span>FRAMES</span><strong id="metricFrames">--</strong></div>
+          <div><span>ELAPSED</span><strong id="metricElapsed">--</strong></div>
+          <div><span>ETA</span><strong id="metricEta">--</strong></div>
+          <div><span>OUTPUT</span><strong id="metricSize">--</strong></div>
+          <div><span>WORKERS / RSS</span><strong id="metricResources">--</strong></div>
+        </div>
+        <div class="detail-message">
+          <i data-lucide="terminal"></i><span id="detailMessage">--</span>
+        </div>
+      </section>
+
+      <section class="preview-band" id="previewBand" hidden>
+        <div class="band-heading preview-heading">
+          <div><span class="band-index">C</span><h2>相机预览</h2></div>
+          <div class="preview-selects">
+            <label><span>CAM</span><select id="previewCamera"></select></label>
+            <button class="icon-button" id="reloadPreview" type="button" aria-label="刷新预览" title="刷新预览"><i data-lucide="refresh-cw"></i></button>
+          </div>
+        </div>
+        <div class="preview-grid">
+          <figure>
+            <figcaption><span>RAW</span><strong id="rawCaption">--</strong></figcaption>
+            <div class="image-well"><img id="rawPreview" alt="原始数据相机预览"><span>等待帧</span></div>
+          </figure>
+          <figure>
+            <figcaption><span>LEROBOT</span><strong id="outputCaption">--</strong></figcaption>
+            <div class="image-well"><img id="outputPreview" alt="LeRobot 数据相机预览"><span>等待已完成 segment</span></div>
+          </figure>
+        </div>
+        <div class="timeline-controls">
+          <div class="range-field inline-range">
+            <div><label for="episodeSlider">EPISODE</label><output id="episodeOutput">0 / 0</output></div>
+            <input id="episodeSlider" type="range" min="0" max="0" value="0">
+          </div>
+          <div class="range-field inline-range">
+            <div><label for="frameSlider">FRAME</label><output id="frameOutput">0 / 0</output></div>
+            <input id="frameSlider" type="range" min="0" max="0" value="0">
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="directoryDialog" class="directory-dialog">
+    <form method="dialog" class="dialog-shell">
+      <div class="dialog-title">
+        <div><span>PATH</span><strong id="directoryPath">/</strong></div>
+        <button class="icon-button" value="cancel" aria-label="关闭目录选择" title="关闭"><i data-lucide="x"></i></button>
+      </div>
+      <div class="directory-toolbar">
+        <button class="icon-button" id="directoryUp" type="button" aria-label="上级目录" title="上级目录"><i data-lucide="corner-left-up"></i></button>
+        <span id="directoryFree">-- FREE</span>
+      </div>
+      <div class="directory-list" id="directoryList"></div>
+      <div class="dialog-actions">
+        <button class="secondary-command" value="cancel">取消</button>
+        <button class="primary-command" id="selectDirectory" type="button"><i data-lucide="check"></i><span>选择当前目录</span></button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script src="/vendor/lucide.min.js"></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
