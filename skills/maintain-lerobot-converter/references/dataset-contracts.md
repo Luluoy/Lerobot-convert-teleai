@@ -67,6 +67,32 @@ and frame conversion must use this identical timeline and frame count.
 Independent streams may have different counts and non-contiguous frame indices. Do not restore the
 old assumption that PKL and camera filenames must share one frame index or filename.
 
+## Zhijun VLA Planner HDF5 Dataset
+
+The built-in adapter slug and display name are both `zhijun-vla-planner-HDF5`. It owns the
+frame-per-file layout written by `rm75_TeleAI/teleop.py` through `utils/collector.py`. A selected
+dataset root contains one immediate directory per episode and each episode directory contains
+naturally ordered `.h5` or `.hdf5` frame files. Selecting one episode directory directly must still
+produce one episode, not one episode per frame. A single HDF5 frame file is also accepted as a
+one-frame episode. Reject a source that mixes loose frame files with episode directories.
+
+Every frame requires these finite, non-empty numeric vectors:
+
+- state/observation: `puppet/joint_position`, `puppet/eef`, `puppet/joint_effort`, `puppet/6f`
+- action: `master/joint_position`, `master/eef`
+
+Expose every dataset under `observations/rgb_images` as an RGB `uint8` image field. The known camera
+defaults are `camera_0 -> head`, `camera_1 -> left_wrist`, `camera_2 -> right_wrist`, and
+`camera_3 -> fourth`; preserve unknown camera IDs with generated image names. Numeric shapes, RGB
+camera sets, and RGB shapes from each episode's first-frame inspection probe must agree. Action-only
+iteration reads both master fields without decoding images so motion pre-scan covers joint and EEF
+commands.
+
+The collector may also store encoded `uint16` depth PNGs under `observations/depth_images`. Do not
+silently convert those to RGB videos or numeric Parquet arrays: the current adapter image contract is
+RGB `uint8` HWC and cannot preserve metric depth in a LeRobot video feature. Report their omission in
+the descriptor warning and leave source files untouched.
+
 ## Motion Filtering
 
 Optional strict-zero repair runs before motion analysis and converted-frame filtering. For every

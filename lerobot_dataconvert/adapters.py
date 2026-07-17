@@ -402,6 +402,312 @@ class HDF5JointAdapter(RawDatasetAdapter):
 
 
 @register_adapter
+class ZhijunVLAPlannerHDF5Adapter(RawDatasetAdapter):
+    slug = "zhijun-vla-planner-HDF5"
+    display_name = "zhijun-vla-planner-HDF5"
+    description = (
+        "Zhijun teleop trajectories with one HDF5 file per frame, including joint, EEF, "
+        "effort, force/torque, and RGB camera fields."
+    )
+    options_schema = [
+        {"key": "fps", "label": "FPS", "type": "number", "default": 20, "min": 1, "max": 240},
+    ]
+
+    NUMERIC_FIELDS = (
+        {
+            "name": "puppet/joint_position",
+            "target": "observation.state",
+            "is_state": True,
+            "is_action": False,
+        },
+        {
+            "name": "master/joint_position",
+            "target": "action",
+            "is_state": False,
+            "is_action": True,
+        },
+        {
+            "name": "puppet/eef",
+            "target": "observation.eef",
+            "is_state": True,
+            "is_action": False,
+        },
+        {
+            "name": "master/eef",
+            "target": "action.eef",
+            "is_state": False,
+            "is_action": True,
+        },
+        {
+            "name": "puppet/joint_effort",
+            "target": "observation.joint_effort",
+            "is_state": True,
+            "is_action": False,
+        },
+        {
+            "name": "puppet/6f",
+            "target": "observation.force_torque",
+            "is_state": True,
+            "is_action": False,
+        },
+    )
+    ACTION_FIELDS = tuple(
+        field["name"] for field in NUMERIC_FIELDS if field["is_action"]
+    )
+    CAMERA_TARGETS = {
+        "camera_0": "head",
+        "camera_1": "left_wrist",
+        "camera_2": "right_wrist",
+        "camera_3": "fourth",
+    }
+    SCHEMA_NAME = "zhijun-vla-planner-HDF5"
+
+    def inspect(self) -> DatasetDescriptor:
+        source = Path(self.source_path)
+        episode_paths = self._list_episode_sources(source)
+        if not episode_paths:
+            raise ValueError(f"No zhijun-vla-planner-HDF5 episodes found in {source}")
+
+        fps = self._fps()
+        episodes: list[EpisodeRef] = []
+        expected_numeric_shapes: dict[str, tuple[int, ...]] | None = None
+        expected_cameras: list[str] | None = None
+        camera_shapes: dict[str, tuple[int, int, int]] = {}
+        warnings: list[str] = []
+        saw_depth = False
+
+        for episode_path in episode_paths:
+            frame_paths = self._frame_files(episode_path)
+            if not frame_paths:
+                continue
+            with h5py.File(frame_paths[0], "r") as handle:
+                numeric_shapes = self._numeric_shapes(handle)
+                cameras = self._camera_names(handle)
+                current_camera_shapes = {
+                    camera: self._read_rgb(handle, camera).shape for camera in cameras
+                }
+                saw_depth = saw_depth or self._has_depth(handle)
+
+            if expected_numeric_shapes is None:
+                expected_numeric_shapes = numeric_shapes
+            elif numeric_shapes != expected_numeric_shapes:
+                raise ValueError(
+                    f"{episode_path.name}: numeric field shapes differ from earlier episodes"
+                )
+            if expected_cameras is None:
+                expected_cameras = cameras
+                camera_shapes = current_camera_shapes
+            elif cameras != expected_cameras:
+                raise ValueError(
+                    f"{episode_path.name}: RGB camera fields differ from earlier episodes"
+                )
+            elif current_camera_shapes != camera_shapes:
+                raise ValueError(
+                    f"{episode_path.name}: RGB camera shapes differ from earlier episodes"
+                )
+
+            episodes.append(
+                EpisodeRef(
+                    key=episode_path.stem if episode_path.is_file() else episode_path.name,
+                    path=str(episode_path),
+                    frame_count=len(frame_paths),
+                    source_bytes=self._path_size(episode_path),
+                    schema=self.SCHEMA_NAME,
+                )
+            )
+
+        if not episodes or expected_numeric_shapes is None:
+            raise ValueError(f"No valid zhijun-vla-planner-HDF5 episodes found in {source}")
+        cameras = expected_cameras or []
+        if not cameras:
+            raise ValueError("No RGB cameras found in observations/rgb_images")
+        if saw_depth:
+            warnings.append(
+                "Depth images are not exposed because LeRobot video fields require RGB uint8 data; "
+                "the source uint16 depth PNGs remain untouched."
+            )
+
+        fields = [
+            RawField(
+                field["name"],
+                expected_numeric_shapes[field["name"]],
+                default_target=field["target"],
+                is_state=field["is_state"],
+                is_action=field["is_action"],
+                fps=fps,
+            )
+            for field in self.NUMERIC_FIELDS
+        ]
+        fields.extend(
+            RawField(
+                camera,
+                camera_shapes[camera],
+                dtype="uint8",
+                is_image=True,
+                default_target=(
+                    f"observation.images.{self.CAMERA_TARGETS.get(camera, _default_camera_name(camera))}"
+                ),
+                fps=fps,
+            )
+            for camera in cameras
+        )
+
+        pixels = sum(shape[0] * shape[1] for shape in camera_shapes.values())
+        memory_mb = max(768, min(4096, int(640 + pixels * 10 / (1024 * 1024))))
+        state_dim = expected_numeric_shapes["puppet/joint_position"][0]
+        action_dim = expected_numeric_shapes["master/joint_position"][0]
+        if state_dim != action_dim:
+            warnings.append(
+                f"puppet joint dimension {state_dim} differs from master joint dimension {action_dim}"
+            )
+        return DatasetDescriptor(
+            adapter=self.slug,
+            source_path=self.source_path,
+            episodes=episodes,
+            fps=fps,
+            cameras=cameras,
+            camera_shapes=camera_shapes,
+            state_dim=state_dim,
+            action_dim=action_dim,
+            source_bytes=sum(episode.source_bytes for episode in episodes),
+            estimated_worker_memory_mb=memory_mb,
+            warnings=warnings,
+            fields=fields,
+        )
+
+    def iter_frames(self, episode: EpisodeRef) -> Iterator[FrameSample]:
+        fps = self._fps()
+        frame_paths = self._frame_files(Path(episode.path))[: episode.frame_count]
+        for frame_index, frame_path in enumerate(frame_paths):
+            with h5py.File(frame_path, "r") as handle:
+                numeric = {
+                    field["name"]: self._read_vector(handle, field["name"])
+                    for field in self.NUMERIC_FIELDS
+                }
+                images = {
+                    camera: self._read_rgb(handle, camera)
+                    for camera in self._camera_names(handle)
+                }
+            yield FrameSample(
+                state=numeric["puppet/joint_position"],
+                action=numeric["master/joint_position"],
+                images=images,
+                timestamp=frame_index / fps,
+                fields=numeric,
+            )
+
+    def iter_action_values(
+        self, episode: EpisodeRef, action_fields: Sequence[str]
+    ) -> Iterator[dict[str, Any]]:
+        unknown = sorted(set(action_fields) - set(self.ACTION_FIELDS))
+        if unknown:
+            raise ValueError(f"Unsupported zhijun HDF5 action fields: {', '.join(unknown)}")
+        for frame_path in self._frame_files(Path(episode.path))[: episode.frame_count]:
+            with h5py.File(frame_path, "r") as handle:
+                yield {name: self._read_vector(handle, name) for name in action_fields}
+
+    def preview(self, episode: EpisodeRef, camera: str, frame_index: int) -> np.ndarray:
+        frames = self._frame_files(Path(episode.path))[: episode.frame_count]
+        if not frames:
+            raise ValueError(f"No HDF5 frames in {episode.path}")
+        frame_path = frames[max(0, min(int(frame_index), len(frames) - 1))]
+        with h5py.File(frame_path, "r") as handle:
+            if camera not in self._camera_names(handle):
+                raise ValueError(f"Unknown RGB camera: {camera}")
+            return self._read_rgb(handle, camera)
+
+    def _fps(self) -> int:
+        try:
+            raw_fps = float(self.options.get("fps", 20))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("FPS must be a positive integer") from exc
+        fps = int(raw_fps)
+        if fps <= 0 or raw_fps != fps:
+            raise ValueError("FPS must be a positive integer")
+        return fps
+
+    @classmethod
+    def _numeric_shapes(cls, handle: h5py.File) -> dict[str, tuple[int, ...]]:
+        return {
+            field["name"]: cls._read_vector(handle, field["name"]).shape
+            for field in cls.NUMERIC_FIELDS
+        }
+
+    @staticmethod
+    def _read_vector(handle: h5py.File, name: str) -> np.ndarray:
+        if name not in handle:
+            raise ValueError(f"Missing required HDF5 field: {name}")
+        value = np.asarray(handle[name], dtype=np.float32)
+        if value.ndim != 1 or value.size == 0:
+            raise ValueError(f"HDF5 field {name} must be a non-empty vector")
+        if not np.all(np.isfinite(value)):
+            raise ValueError(f"HDF5 field {name} contains non-finite values")
+        return np.ascontiguousarray(value)
+
+    @staticmethod
+    def _camera_names(handle: h5py.File) -> list[str]:
+        group_path = "observations/rgb_images"
+        if group_path not in handle or not isinstance(handle[group_path], h5py.Group):
+            return []
+        group = handle[group_path]
+        return sorted(
+            [name for name in group if isinstance(group[name], h5py.Dataset)],
+            key=lambda name: natural_key(Path(name)),
+        )
+
+    @staticmethod
+    def _read_rgb(handle: h5py.File, camera: str) -> np.ndarray:
+        path = f"observations/rgb_images/{camera}"
+        if path not in handle:
+            raise ValueError(f"Missing RGB camera field: {path}")
+        dataset = handle[path]
+        value = dataset[0] if dataset.ndim == 1 and len(dataset) == 1 else dataset[()]
+        decoded = decode_image(value)
+        if decoded is None:
+            raise ValueError(f"Could not decode RGB camera field: {path}")
+        return decoded
+
+    @staticmethod
+    def _has_depth(handle: h5py.File) -> bool:
+        path = "observations/depth_images"
+        return path in handle and isinstance(handle[path], h5py.Group) and len(handle[path]) > 0
+
+    @classmethod
+    def _list_episode_sources(cls, source: Path) -> list[Path]:
+        if source.is_file() and source.suffix.lower() in {".h5", ".hdf5"}:
+            return [source]
+        if not source.is_dir():
+            return []
+        direct_frames = HDF5JointAdapter._list_frame_files(source)
+        episode_dirs = [
+            path
+            for path in source.iterdir()
+            if path.is_dir() and HDF5JointAdapter._list_frame_files(path)
+        ]
+        if direct_frames and episode_dirs:
+            raise ValueError(
+                "Mixed zhijun HDF5 layout: source contains both frame files and episode directories"
+            )
+        if direct_frames:
+            return [source]
+        return sorted(episode_dirs, key=natural_key)
+
+    @staticmethod
+    def _frame_files(path: Path) -> list[Path]:
+        if path.is_file() and path.suffix.lower() in {".h5", ".hdf5"}:
+            return [path]
+        if not path.is_dir():
+            return []
+        return HDF5JointAdapter._list_frame_files(path)
+
+    @staticmethod
+    def _path_size(path: Path) -> int:
+        if path.is_file():
+            return path.stat().st_size
+        return sum(frame.stat().st_size for frame in HDF5JointAdapter._list_frame_files(path))
+
+
+@register_adapter
 class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
     slug = "multiprocessing_pool_dataset"
     display_name = "MultiProcessing Pool Dataset"

@@ -145,6 +145,19 @@ LEROBOT_DATACONVERT_PLUGINS=my_project.my_adapter ./start.sh
 - `puppet/joint_position` / `master/joint_position` schema。
 - JPEG buffer 或原始 HWC RGB 图像。
 
+内置 `zhijun-vla-planner-HDF5` 适配器支持
+`rm75_TeleAI/teleop.py` 及其 `utils/collector.py` 保存的数据：
+
+- 数据集根目录下每个直接子目录是一条 episode，episode 内每个 HDF5 文件是一帧；也可直接选择单条 episode 目录。
+- `puppet/joint_position`、`puppet/eef`、`puppet/joint_effort`、`puppet/6f` 状态/观测字段。
+- `master/joint_position` 和 `master/eef` 两个 action 字段；动作扫描无需解码图像。
+- `observations/rgb_images/camera_*` 中实际存在的全部 RGB 相机，包括 `camera_3`。
+- 采集器的 `uint16` 深度 PNG 不会映射为 LeRobot 视频字段；当前转换契约只接受 RGB `uint8`，检查结果会明确提示，源深度文件保持不变。
+
+旧 `hdf5_joint` 能读取该数据中的关节字段和前三路 RGB，但会忽略 EEF、力矩、六维力、
+第 4 路 RGB 和深度，而且直接选择单条轨迹目录时会把每帧当成一条 episode。因此需要完整
+转换该采集格式时应选择 `zhijun-vla-planner-HDF5`。
+
 内置 `multiprocessing_pool_dataset`（界面名称 `MultiProcessing Pool Dataset`）适配器支持 TeleAxis Collector schema v3：
 
 - `episode_XXXXXX/META/meta.json` 中状态为 `complete` 且没有保存错误的 episode。
