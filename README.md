@@ -53,6 +53,17 @@ systemctl --user stop lerobot-dataconvert
 本地修改随后消失，自动检查也不会自行恢复；必须手动点击“检查远端更新”。平台不会
 自动 stash、reset、覆盖本地修改或创建 merge commit。
 
+需要临时使用 GitHub PAT 推送当前工程一次时，先提交所有预期修改，再运行：
+
+```bash
+./push-with-pat.sh
+```
+
+脚本默认把当前 `HEAD` 推送到 `origin` 的同名分支。PAT 从终端隐藏输入，不会写入命令
+历史、remote 或 credential helper；推送后会核对远端 SHA。可选参数为 remote 和远端分支，
+例如 `./push-with-pat.sh origin main`。脚本不会自动提交、修改 upstream 或处理未提交修改。
+Fine-grained PAT 需要选择该仓库并授予 `Contents: Read and write` 权限。
+
 也可以安装到一个含 LeRobot 0.3.3 的环境：
 
 ```bash

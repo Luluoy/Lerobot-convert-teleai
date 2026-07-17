@@ -151,10 +151,24 @@ select { appearance: none; padding-right: 30px; background-image: linear-gradien
   top: var(--header-height);
   align-self: start;
   height: calc(100vh - var(--header-height));
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  height: var(--control-rail-height, calc(100dvh - var(--header-height)));
+  overflow: hidden;
   border-right: 1px solid var(--line-strong);
   background: var(--surface);
+}
+
+#jobForm {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  height: 100%;
+  min-height: 0;
+}
+
+.rail-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .rail-section { padding: 18px; border-bottom: 1px solid var(--line); }
@@ -248,7 +262,7 @@ input[type="checkbox"] { width: 16px; height: 16px; margin: 0; border-radius: 0;
 .motion-action-fields strong + span { margin-top: 8px; }
 .motion-toggles { margin-top: 14px; }
 .motion-scan-readout { margin-top: 10px; }
-.rail-actions { position: sticky; bottom: 0; padding: 14px 18px; border-top: 1px solid var(--line-strong); background: var(--surface); }
+.rail-actions { position: relative; z-index: 1; padding: 14px 18px; border-top: 1px solid var(--line-strong); background: var(--surface); }
 .rail-actions .primary-command { width: 100%; height: 46px; }
 
 .main-stage { min-width: 0; }
@@ -369,6 +383,8 @@ input[type="checkbox"] { width: 16px; height: 16px; margin: 0; border-radius: 0;
   .backend-notice-actions, .update-notice-actions { grid-column: 1 / -1; justify-content: flex-end; flex-wrap: wrap; }
   .workspace { display: block; }
   .control-rail { position: static; height: auto; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line-strong); }
+  #jobForm { display: block; height: auto; }
+  .rail-scroll { overflow: visible; }
   .rail-actions { position: static; }
   .field-map-head { display: none; }
   .field-map-row { grid-template-columns: 14px minmax(0, 1fr) 30px; }

@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { rm } from "node:fs/promises";
 
 const baseURL = process.env.UI_BASE_URL || "http://127.0.0.1:8765";
+const python = process.env.UI_PYTHON || process.env.LEROBOT_DATACONVERT_PYTHON || "python";
 const outputPath = "/tmp/lerobot-dataconvert-ui-e2e";
 const cachePath = `/tmp/.${outputPath.split("/").pop()}.lerobot-cache`;
 const fixturePath = "/tmp/lerobot-dataconvert-pool-ui-fixture";
@@ -10,7 +11,7 @@ await rm(outputPath, { recursive: true, force: true });
 await rm(cachePath, { recursive: true, force: true });
 await rm(fixturePath, { recursive: true, force: true });
 execFileSync(
-  "/home/amin/miniconda3/envs/lerobot21/bin/python",
+  python,
   ["-c", `from pathlib import Path; from tests.test_multiprocessing_pool_adapter import create_pool_dataset; create_pool_dataset(Path("${fixturePath}"), episodes=2, frames=8, action_pattern=[0,0,0,1,1,1,1,2])`],
   { cwd: new URL("..", import.meta.url).pathname, stdio: "inherit" },
 );
@@ -18,6 +19,30 @@ execFileSync(
 const browser = await chromium.launch({ headless: true, executablePath: "/usr/bin/google-chrome" });
 const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, deviceScaleFactor: 1 });
 const errors = [];
+
+async function assertCreateButtonInRailViewport(label) {
+  const metrics = await page.locator("#createJobButton").evaluate((button) => {
+    const buttonBox = button.getBoundingClientRect();
+    const railBox = button.closest(".control-rail").getBoundingClientRect();
+    return {
+      buttonTop: buttonBox.top,
+      buttonBottom: buttonBox.bottom,
+      railTop: railBox.top,
+      railBottom: railBox.bottom,
+      viewportBottom: window.innerHeight,
+      hidden: button.hidden,
+      display: getComputedStyle(button).display,
+    };
+  });
+  if (
+    metrics.hidden
+    || metrics.display === "none"
+    || metrics.buttonTop < metrics.railTop - 1
+    || metrics.buttonBottom > Math.min(metrics.railBottom, metrics.viewportBottom) + 1
+  ) throw new Error(`Start conversion button escaped the control rail (${label}): ${JSON.stringify(metrics)}`);
+  return metrics;
+}
+
 page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
 page.on("pageerror", (error) => errors.push(error.message));
 page.on("response", (response) => {
@@ -38,6 +63,12 @@ if (updateStatus === "local_changes") {
   const updateNotice = await page.textContent("#updateNotice");
   if (!updateNotice.includes("暂停") || !updateNotice.includes("技术帮助") || !updateNotice.includes("Agent")) throw new Error("Local-change update guidance is incomplete");
 }
+await assertCreateButtonInRailViewport("desktop update notice");
+await page.setViewportSize({ width: 900, height: 600 });
+await page.waitForTimeout(50);
+await assertCreateButtonInRailViewport("short desktop viewport");
+await page.setViewportSize({ width: 1440, height: 1000 });
+await page.waitForTimeout(50);
 await page.screenshot({ path: "/tmp/lerobot-ui-desktop-update.png" });
 await page.click('[data-browse="sourcePath"]');
 await page.waitForSelector("#directoryDialog[open] .directory-entry");
@@ -87,6 +118,10 @@ for (const [source, target] of mappings) {
   await row.locator("[data-map-target]").fill(target);
 }
 if ((await page.locator('[data-map-source] option:checked').filter({ hasText: "joint_state/qpos" }).count()) !== 2) throw new Error("Duplicate raw fields were not selectable");
+const buttonBeforeRailScroll = await assertCreateButtonInRailViewport("long field mapping");
+await page.locator(".rail-scroll").evaluate((element) => { element.scrollTop = Math.floor(element.scrollHeight / 2); });
+const buttonAfterRailScroll = await assertCreateButtonInRailViewport("scrolled field mapping");
+if (Math.abs(buttonBeforeRailScroll.buttonTop - buttonAfterRailScroll.buttonTop) > 1) throw new Error("Start conversion footer moved with rail content");
 await page.locator(".field-map-row").first().evaluate((element) => element.scrollIntoView({ block: "center" }));
 await page.screenshot({ path: "/tmp/lerobot-ui-desktop-fields.png" });
 await page.check("#fillZeroStateAction");
@@ -110,7 +145,7 @@ await page.waitForFunction(() => document.querySelector("#detailState")?.textCon
 await page.waitForFunction(() => document.querySelector("#outputPreview")?.classList.contains("loaded"), null, { timeout: 15000 });
 if ((await page.textContent("#detailName")) !== "ui-e2e") throw new Error("Job form values changed during bootstrap");
 execFileSync(
-  "/home/amin/miniconda3/envs/lerobot21/bin/python",
+  python,
   ["-c", `import pyarrow.parquet as pq; table = pq.read_table("${outputPath}/data/chunk-000/file-000.parquet"); assert "observation.velocity" in table.column_names; assert "observation.qpos_copy" in table.column_names; assert table.num_rows == 4, table.num_rows`],
   { stdio: "inherit" },
 );
@@ -164,7 +199,7 @@ await page.waitForFunction(
 const jobsAfterDelete = await (await page.request.get(`${baseURL}/api/jobs`)).json();
 if (jobsAfterDelete.jobs.some((job) => job.id === jobId)) throw new Error("Deleted task remains in the list");
 execFileSync(
-  "/home/amin/miniconda3/envs/lerobot21/bin/python",
+  python,
   ["-c", `from pathlib import Path; assert Path("${outputPath}/meta/info.json").is_file(); assert Path("${cachePath}/manifest.json").is_file()`],
   { stdio: "inherit" },
 );

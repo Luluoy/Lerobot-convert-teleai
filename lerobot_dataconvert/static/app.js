@@ -1,6 +1,9 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
+let controlRailLayoutFrame = null;
+let controlRailResizeObserver = null;
+
 const state = {
   bootstrap: null,
   jobs: [],
@@ -42,6 +45,34 @@ const updateStatusLabels = {
   not_checked: "尚未检查更新",
 };
 
+function syncControlRailLayout() {
+  if (controlRailLayoutFrame != null) return;
+  controlRailLayoutFrame = requestAnimationFrame(() => {
+    controlRailLayoutFrame = null;
+    const rail = $(".control-rail");
+    if (!rail) return;
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      rail.style.removeProperty("--control-rail-height");
+      return;
+    }
+    const stickyTop = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--header-height")) || 0;
+    const railTop = Math.max(stickyTop, rail.getBoundingClientRect().top);
+    rail.style.setProperty("--control-rail-height", `${Math.max(76, Math.floor(window.innerHeight - railTop))}px`);
+  });
+}
+
+function bindControlRailLayout() {
+  window.addEventListener("resize", syncControlRailLayout);
+  window.addEventListener("scroll", syncControlRailLayout, { passive: true });
+  window.visualViewport?.addEventListener("resize", syncControlRailLayout);
+  window.visualViewport?.addEventListener("scroll", syncControlRailLayout);
+  if ("ResizeObserver" in window) {
+    controlRailResizeObserver = new ResizeObserver(syncControlRailLayout);
+    [$(".topbar"), $("#backendNotice"), $("#updateNotice")].filter(Boolean).forEach((element) => controlRailResizeObserver.observe(element));
+  }
+  syncControlRailLayout();
+}
+
 function invalidateInspection() {
   state.descriptor = null;
   $("#createJobButton").disabled = true;
@@ -81,6 +112,7 @@ function renderRepositoryUpdate(status) {
   metadata.textContent = meta.filter(Boolean).join(" / ");
   metadata.hidden = !metadata.textContent;
   $("#updatePull").hidden = status.status !== "update_available";
+  syncControlRailLayout();
   window.lucide?.createIcons();
 }
 
@@ -815,6 +847,7 @@ function setConnection(online) {
   node.classList.toggle("offline", !online);
   node.lastChild.textContent = online ? "LOCAL" : "OFFLINE";
   $("#backendNotice").hidden = online;
+  syncControlRailLayout();
 }
 
 async function initializeBackend(showFailure = false) {
@@ -883,6 +916,7 @@ function bindEvents() {
 }
 
 bindEvents();
+bindControlRailLayout();
 window.lucide?.createIcons();
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
 initializeBackend();

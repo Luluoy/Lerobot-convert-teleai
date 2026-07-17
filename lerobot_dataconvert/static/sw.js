@@ -1,4 +1,4 @@
-const CACHE = "lerobot-dataconvert-v11";
+const CACHE = "lerobot-dataconvert-v12";
 const SHELL = ["/", "/app.css", "/app.js", "/vendor/lucide.min.js", "/manifest.webmanifest", "/icons/app-icon.svg", "/icons/app-icon-192.png", "/icons/app-icon-512.png"];
 
 self.addEventListener("install", (event) => {

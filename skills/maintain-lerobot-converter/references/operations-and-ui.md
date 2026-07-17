@@ -54,6 +54,11 @@ Keep desktop and 390 px mobile layouts free of horizontal body overflow, text ov
 resizing. The table may own an internal horizontal scroller. When changing cached shell assets,
 bump the cache key in `static/sw.js` so installed PWAs receive the update.
 
+On desktop, the conversion control rail owns a dedicated scrolling content region and a separate,
+always-visible submit footer. Do not place the submit action at the end of the scroll content and rely
+on `position: sticky; bottom: 0`: a bottom-sticky element below the viewport is not pulled into view,
+so long inspection summaries or field mappings can make the start-conversion action appear missing.
+
 After inspection, the field-mapping editor starts with no rows. Its add action creates one row with
 a selectable raw source and an editable LeRobot target; the source selector exposes the adapter's
 type, shape, and FPS metadata. Rows are independently removable, raw sources may repeat, and the UI
@@ -120,3 +125,8 @@ journalctl --user -u lerobot-dataconvert -p warning --since today --no-pager
 - A first push should verify the destination with `git ls-remote`, add the requested remote without
   overwriting an existing one, push the current branch with upstream tracking, and verify the remote
   branch SHA afterward.
+- `push-with-pat.sh` is the one-time GitHub HTTPS path for an already configured remote. It requires a
+  clean worktree, reads the PAT from a hidden `/dev/tty` prompt, disables credential helpers, converts
+  a credential-free GitHub HTTPS or SSH remote to a temporary HTTPS push URL, and verifies the remote
+  branch SHA. It must not accept a PAT as an argument, persist credentials, rewrite the remote, commit
+  changes, or set upstream tracking.
