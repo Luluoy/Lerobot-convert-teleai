@@ -85,6 +85,7 @@ class RepositoryUpdaterTest(unittest.TestCase):
         updated = self.updater.pull()
         self.assertEqual(updated["status"], "updated")
         self.assertTrue(updated["restart_required"])
+        self.assertIn("./apply-update.sh", updated["message"])
         self.assertEqual((self.local / "version.txt").read_text(encoding="utf-8"), "v2\n")
         self.assertEqual(self.updater.check()["status"], "up_to_date")
 

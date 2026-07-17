@@ -20,6 +20,9 @@ implementation makes a statement below inaccurate.
   default unless the allocator and repeated-preview E2E have been verified together.
 - `install-systemd-service.sh` creates and enables the user unit at
   `~/.config/systemd/user/lerobot-dataconvert.service`.
+- `apply-update.sh` is the post-pull deployment step. It never runs Git, refuses dirty worktrees or
+  active conversion jobs, installs declared Python dependencies, restarts the installed user unit,
+  and waits for `/api/health`.
 - The PWA does not start a backend by itself. The user systemd service is the supported automatic
   backend startup mechanism.
 
@@ -67,7 +70,7 @@ After bootstrap, start the remote check asynchronously so task controls are not 
 full-width Git status band with real branch/upstream/ahead/behind data and a manual check command.
 Only `update_available` exposes the pull command. Local changes must show that automatic updates are
 paused, recommend technical help or asking an Agent, and keep manual check available. After a pull,
-tell the user to ask an Agent to check dependencies through `INSTALL.md` and restart the service.
+direct the user to run `./apply-update.sh` from the checkout or ask an Agent to follow `INSTALL.md`.
 
 Do not hide update errors or imply that fetch, pull, dependency installation, and service restart are
 the same operation. Keep the status band usable at 390 px without body overflow.

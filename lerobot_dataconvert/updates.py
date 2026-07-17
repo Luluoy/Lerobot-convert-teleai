@@ -49,7 +49,7 @@ class RepositoryUpdater:
             result.update(
                 {
                     "status": "updated",
-                    "message": "已拉取到最新版。请让 Agent 按 INSTALL.md 检查依赖并重启后端服务。",
+                    "message": "已拉取到最新版。请在项目目录运行 ./apply-update.sh，或让 Agent 按 INSTALL.md 完成部署。",
                     "restart_required": True,
                     "updated_at": time.time(),
                 }

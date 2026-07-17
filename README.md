@@ -38,8 +38,15 @@ systemctl --user stop lerobot-dataconvert
 ## 代码更新
 
 后端从 Git checkout 启动时，PWA 会异步检查当前分支的远端跟踪分支。工作区干净且
-本地仅落后远端时，页面提供“拉取更新”，后端只执行 `git pull --ff-only`。拉取完成
-后，让 Agent 按 `INSTALL.md` 检查依赖并重启服务。
+本地仅落后远端时，页面提供“拉取更新”，后端只执行 `git pull --ff-only`。页面拉取或
+手动执行 `git pull --ff-only` 后，在项目根目录运行：
+
+```bash
+./apply-update.sh
+```
+
+该脚本不会操作 Git；它会确认工作区干净且没有活动转换任务，安装声明的 Python 依赖，
+重启已安装的 systemd 用户服务，并等待后端恢复健康。运行前端测试时再单独执行 `npm ci`。
 
 若检测到任何已跟踪或未跟踪的本地修改，平台会把暂停状态记录到运行状态目录的
 `git-update-state.json`，停止自动检查与更新，并提示寻求技术帮助或询问 Agent。即使
