@@ -171,15 +171,16 @@ def pool_config(source: Path, output: Path) -> JobConfig:
         camera_names={"Cam1": "head", "Cam2": "left_wrist"},
         state_names=[],
         action_names=[],
-        field_mapping={
-            "joint_state/qpos": "observation.state",
-            "joint_state/qvel": "observation.velocity",
-            "joint_state/torque": "observation.effort",
-            "joint_action/action": "action",
-            "eef_action/action": "observation.eef_pose",
-            "Cam1": "observation.images.head",
-            "Cam2": "observation.images.left_wrist",
-        },
+        field_mapping=[
+            {"source": "joint_state/qpos", "target": "observation.state"},
+            {"source": "joint_state/qpos", "target": "observation.qpos_copy"},
+            {"source": "joint_state/qvel", "target": "observation.velocity"},
+            {"source": "joint_state/torque", "target": "observation.effort"},
+            {"source": "joint_action/action", "target": "action"},
+            {"source": "eef_action/action", "target": "observation.eef_pose"},
+            {"source": "Cam1", "target": "observation.images.head"},
+            {"source": "Cam2", "target": "observation.images.left_wrist"},
+        ],
         adapter_options={},
         skip_zero_state=False,
     )
@@ -202,6 +203,9 @@ class MultiProcessingPoolDatasetTest(unittest.TestCase):
             self.assertEqual(descriptor.camera_shapes, {"Cam1": (32, 48, 3), "Cam2": (24, 36, 3)})
             fields = {field.name: field for field in descriptor.fields}
             self.assertEqual(fields["joint_state/qpos"].default_target, "observation.state")
+            self.assertTrue(fields["joint_state/qpos"].is_state)
+            self.assertTrue(fields["joint_state/qvel"].is_state)
+            self.assertTrue(fields["joint_state/torque"].is_state)
             self.assertEqual(fields["joint_action/action"].default_target, "action")
             self.assertTrue(fields["joint_action/action"].is_action)
             self.assertTrue(fields["eef_action/action"].is_action)
@@ -241,6 +245,7 @@ class MultiProcessingPoolDatasetTest(unittest.TestCase):
             self.assertFalse(failures, failures[0]["traceback"] if failures else "")
             self.assertTrue((output / ".segment-complete.json").is_file())
             table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
+            self.assertIn("observation.qpos_copy", table.column_names)
             self.assertIn("observation.velocity", table.column_names)
             self.assertIn("observation.effort", table.column_names)
             self.assertIn("observation.eef_pose", table.column_names)
@@ -248,6 +253,73 @@ class MultiProcessingPoolDatasetTest(unittest.TestCase):
                 preview_output_frame(output, "v2.1", "observation.images.head", 0, 1).shape,
                 (32, 48, 3),
             )
+
+    def test_zero_state_action_fields_are_forward_filled_independently(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pool-zero-fill-test-") as temporary:
+            root = Path(temporary)
+            source = root / "raw"
+            create_pool_dataset(source, episodes=1, frames=4)
+            episode = source / "episode_000000"
+
+            def replace_field(stream: str, frame_index: int, name: str, value: np.ndarray) -> None:
+                path = next((episode / stream).glob(f"frame_{frame_index:09d}_*.pkl"))
+                record = pickle.loads(path.read_bytes())
+                record[name] = np.asarray(value, dtype=np.float32)
+                path.write_bytes(pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL))
+
+            zeros4 = np.zeros(4, dtype=np.float32)
+            replace_field("joint_state", 0, "torque", zeros4)
+            replace_field("joint_state", 1, "qpos", zeros4)
+            replace_field("joint_state", 1, "qvel", np.array([0, 0, 0, 1]))
+            replace_field("joint_action", 1, "action", zeros4)
+            replace_field("joint_state", 2, "qpos", zeros4)
+            replace_field("joint_state", 2, "qvel", zeros4)
+            replace_field("eef_action", 2, "action", np.zeros(16, dtype=np.float32))
+            replace_field("joint_state", 3, "torque", zeros4)
+
+            adapter = create_adapter("multiprocessing_pool_dataset", str(source))
+            descriptor = adapter.inspect()
+            config = pool_config(source, root / "output")
+            config.fill_zero_state_action = True
+            output = root / "segment"
+            messages: queue.Queue = queue.Queue()
+            run_segment_worker(
+                {
+                    "segment_id": "000000",
+                    "output_dir": str(output),
+                    "config": config.to_dict(),
+                    "descriptor": descriptor.to_dict(),
+                    "source_indices": [0],
+                    "episodes": [descriptor.episodes[0].to_dict()],
+                    "cpu_id": None,
+                },
+                messages,
+            )
+            results = []
+            while not messages.empty():
+                results.append(messages.get())
+            failures = [message for message in results if message["type"] == "failed"]
+            self.assertFalse(failures, failures[0]["traceback"] if failures else "")
+
+            table = pq.read_table(output / "data/chunk-000/episode_000000.parquet")
+
+            def column(name: str) -> np.ndarray:
+                return np.asarray(table[name].to_pylist(), dtype=np.float32)
+
+            state = column("observation.state")
+            velocity = column("observation.velocity")
+            effort = column("observation.effort")
+            action = column("action")
+            eef_action = column("observation.eef_pose")
+            np.testing.assert_array_equal(state[1], state[0])
+            np.testing.assert_array_equal(state[2], state[0])
+            np.testing.assert_array_equal(column("observation.qpos_copy"), state)
+            np.testing.assert_array_equal(velocity[1], [0, 0, 0, 1])
+            np.testing.assert_array_equal(velocity[2], velocity[1])
+            np.testing.assert_array_equal(action[1], action[0])
+            np.testing.assert_array_equal(eef_action[2], eef_action[1])
+            np.testing.assert_array_equal(effort[0], zeros4)
+            np.testing.assert_array_equal(effort[3], effort[2])
 
     def test_async_streams_are_aligned_by_nearest_timestamp(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pool-fps-test-") as temporary:
@@ -318,9 +390,17 @@ class MultiProcessingPoolDatasetTest(unittest.TestCase):
                 frames=8,
                 action_pattern=[0, 0, 0, 1, 1, 1, 1, 2],
             )
+            zero_action_path = next(
+                (source / "episode_000000" / "joint_action").glob("frame_000000004_*.pkl")
+            )
+            zero_action = pickle.loads(zero_action_path.read_bytes())
+            zero_action["action"] = np.zeros(4, dtype=np.float32)
+            zero_action_path.write_bytes(
+                pickle.dumps(zero_action, protocol=pickle.HIGHEST_PROTOCOL)
+            )
             adapter = create_adapter("multiprocessing_pool_dataset", str(source))
             descriptor = adapter.inspect()
-            scan = scan_dataset_motion(adapter, descriptor, True, True, 3)
+            scan = scan_dataset_motion(adapter, descriptor, True, True, 3, True)
             self.assertEqual(scan["action_fields"], ["joint_action/action", "eef_action/action"])
             self.assertEqual(scan["leading_segments"], 1)
             self.assertEqual(scan["stationary_segments"], 1)
@@ -332,6 +412,7 @@ class MultiProcessingPoolDatasetTest(unittest.TestCase):
             config.trim_stationary_start = True
             config.remove_stationary_segments = True
             config.stationary_frames = 3
+            config.fill_zero_state_action = True
             messages: queue.Queue = queue.Queue()
             output = root / "segment"
             run_segment_worker(
@@ -379,20 +460,38 @@ class MultiProcessingPoolDatasetTest(unittest.TestCase):
             descriptor = create_adapter("multiprocessing_pool_dataset", str(source)).inspect()
             camera_names = {"Cam1": "head", "Cam2": "left_wrist"}
 
+            repeated_source = _normalize_field_mapping(
+                {
+                    "field_mapping": [
+                        {"source": "joint_state/qpos", "target": "observation.state"},
+                        {"source": "joint_state/qpos", "target": "observation.qpos_copy"},
+                    ]
+                },
+                descriptor,
+                camera_names,
+            )
+            self.assertEqual(
+                [row["source"] for row in repeated_source],
+                ["joint_state/qpos", "joint_state/qpos"],
+            )
             with self.assertRaisesRegex(ValueError, "must be unique"):
                 _normalize_field_mapping(
                     {
-                        "field_mapping": {
-                            "joint_state/qpos": "action",
-                            "joint_action/action": "action",
-                        }
+                        "field_mapping": [
+                            {"source": "joint_state/qpos", "target": "action"},
+                            {"source": "joint_action/action", "target": "action"},
+                        ]
                     },
                     descriptor,
                     camera_names,
                 )
             with self.assertRaisesRegex(ValueError, "Image field"):
                 _normalize_field_mapping(
-                    {"field_mapping": {"Cam1": "observation.state"}},
+                    {
+                        "field_mapping": [
+                            {"source": "Cam1", "target": "observation.state"}
+                        ]
+                    },
                     descriptor,
                     camera_names,
                 )

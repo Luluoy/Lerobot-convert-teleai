@@ -16,8 +16,9 @@ from typing import Any
 from . import __version__
 from .adapters import adapter_catalog, create_adapter, jpeg_bytes
 from .conversion import camera_feature_map, preview_output_frame, revision_catalog
-from .manager import JobManager
+from .manager import ACTIVE_STATES, JobManager
 from .models import DatasetDescriptor, EpisodeRef, JobConfig
+from .updates import RepositoryUpdater
 
 
 STATIC_DIR = Path(__file__).with_name("static")
@@ -26,9 +27,12 @@ STATIC_DIR = Path(__file__).with_name("static")
 class AppServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], manager: JobManager):
+    def __init__(
+        self, address: tuple[str, int], manager: JobManager, updater: RepositoryUpdater
+    ):
         super().__init__(address, RequestHandler)
         self.manager = manager
+        self.updater = updater
 
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -75,6 +79,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     payload["adapter"], payload["source_path"], payload.get("adapter_options")
                 )
                 self._json(descriptor)
+            elif parsed.path == "/api/update/check":
+                self._json(self.server.updater.check(manual=bool(payload.get("manual", False))))
+            elif parsed.path == "/api/update/pull":
+                if any(
+                    job["state"] in ACTIVE_STATES for job in self.server.manager.list_jobs()
+                ):
+                    raise ValueError("存在活动转换任务，请等待任务结束或停止任务后再更新")
+                self._json(self.server.updater.pull())
             elif parsed.path == "/api/motion-scan":
                 self._json(self.server.manager.scan_motion(payload))
             elif parsed.path == "/api/preview/raw":
@@ -265,7 +277,13 @@ def main() -> None:
     )
     args = parser.parse_args()
     manager = JobManager(args.state_dir.expanduser())
-    server = AppServer((args.host, args.port), manager)
+    repository_root = Path(
+        os.environ.get(
+            "LEROBOT_DATACONVERT_REPO", Path(__file__).resolve().parent.parent
+        )
+    )
+    updater = RepositoryUpdater(repository_root, args.state_dir)
+    server = AppServer((args.host, args.port), manager, updater)
     stopping = threading.Event()
 
     def request_shutdown(*_: Any) -> None:

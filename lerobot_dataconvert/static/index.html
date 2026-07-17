@@ -46,6 +46,23 @@
     </div>
   </section>
 
+  <section class="update-notice" id="updateNotice" aria-live="polite" hidden>
+    <i data-lucide="git-branch" aria-hidden="true"></i>
+    <div>
+      <strong id="updateTitle">代码更新</strong>
+      <p id="updateMessage"></p>
+      <code id="updateMeta" hidden></code>
+    </div>
+    <div class="update-notice-actions">
+      <button class="secondary-command" id="updateCheck" type="button">
+        <i data-lucide="refresh-cw"></i><span>检查远端更新</span>
+      </button>
+      <button class="primary-command" id="updatePull" type="button" hidden>
+        <i data-lucide="download"></i><span>拉取更新</span>
+      </button>
+    </div>
+  </section>
+
   <main class="workspace">
     <aside class="control-rail" aria-label="转换设置">
       <form id="jobForm">
@@ -102,11 +119,13 @@
         </section>
 
         <section class="rail-section motion-section">
-          <div class="section-title"><span>03</span><h2>动作过滤</h2></div>
+          <div class="section-title"><span>03</span><h2>数据清洗</h2></div>
           <div class="motion-action-fields" id="motionActionFields" hidden>
-            <span>ACTION FIELDS</span><strong></strong>
+            <span>STATE FIELDS</span><strong data-state-fields></strong>
+            <span>ACTION FIELDS</span><strong data-action-fields></strong>
           </div>
           <div class="toggle-row motion-toggles">
+            <label title="按字段严格判断全部元素为 0；Episode 首帧没有上一帧，因此保持原值"><input id="fillZeroStateAction" type="checkbox"><span>全 0 STATE/ACTION 使用上一帧</span></label>
             <label><input id="trimStationaryStart" type="checkbox"><span>删除 Episode 起始静止帧</span></label>
             <label><input id="removeStationarySegments" type="checkbox"><span>删除连续静止冗余帧</span></label>
           </div>

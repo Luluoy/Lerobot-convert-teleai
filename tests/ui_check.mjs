@@ -26,6 +26,19 @@ page.on("response", (response) => {
 
 await page.goto(baseURL, { waitUntil: "networkidle" });
 await page.waitForFunction(() => document.querySelector("#runtimeLabel")?.textContent?.includes("0.1.0"));
+await page.waitForFunction(
+  () => document.querySelector("#updateNotice")?.dataset.status && document.querySelector("#updateNotice").dataset.status !== "checking",
+  null,
+  { timeout: 65000 },
+);
+const updateStatus = await page.getAttribute("#updateNotice", "data-status");
+if (await page.locator("#updateCheck").isDisabled()) throw new Error("Manual update check is unavailable");
+if ((await page.locator("#updatePull").isHidden()) === (updateStatus === "update_available")) throw new Error(`Pull visibility does not match ${updateStatus}`);
+if (updateStatus === "local_changes") {
+  const updateNotice = await page.textContent("#updateNotice");
+  if (!updateNotice.includes("暂停") || !updateNotice.includes("技术帮助") || !updateNotice.includes("Agent")) throw new Error("Local-change update guidance is incomplete");
+}
+await page.screenshot({ path: "/tmp/lerobot-ui-desktop-update.png" });
 await page.click('[data-browse="sourcePath"]');
 await page.waitForSelector("#directoryDialog[open] .directory-entry");
 await page.click('#directoryDialog button[value="cancel"]');
@@ -36,26 +49,47 @@ await page.fill("#repoId", "ui-e2e");
 await page.fill("#robotType", "test_arm");
 await page.fill("#taskInstruction", "Move the test arm through the recorded trajectory.");
 if ((await page.getAttribute("#cpuLimitPercent", "max")) !== "95") throw new Error("CPU limit can exceed 95 percent");
+if (await page.locator("#fillZeroStateAction").isDisabled()) throw new Error("Zero state/action fill is disabled before inspection");
 await page.locator("#cpuLimitPercent").fill("95");
 await page.click("#inspectButton");
 await page.waitForSelector("#datasetReadout:not([hidden])");
 const fpsInput = page.locator('[data-adapter-option="fps"]');
 if ((await fpsInput.inputValue()) !== "20" || (await fpsInput.getAttribute("max")) !== "20") throw new Error("Target FPS and field-rate limit were not applied");
 if (!(await page.textContent("#datasetReadout")).includes("OUTPUT / MAX FPS")) throw new Error("Output FPS summary did not render");
-if ((await page.locator(".field-map-row").count()) !== 7) throw new Error("Raw field catalog did not render");
-if (!(await page.locator(".field-map-row").first().textContent()).includes("20.00 FPS")) throw new Error("Per-field FPS did not render");
-if ((await page.inputValue('[data-field-source="joint_state/qpos"]')) !== "observation.state") throw new Error("State default mapping is missing");
-if ((await page.inputValue('[data-field-source="Cam1"]')) !== "observation.images.head") throw new Error("Camera default mapping is missing");
-if (!(await page.textContent("#motionActionFields")).includes("joint_action/action + eef_action/action")) throw new Error("Declared action fields did not render");
+if ((await page.locator(".field-map-row").count()) !== 0) throw new Error("Field mappings were populated automatically");
+await page.click("[data-field-map-add]");
+const sampleMapping = page.locator(".field-map-row").last();
+if ((await sampleMapping.locator("[data-map-source] option").count()) !== 8) throw new Error("Raw field choices did not render");
+await sampleMapping.locator("[data-map-source]").selectOption("joint_state/qpos");
+if (!(await sampleMapping.locator("[data-map-meta]").textContent()).includes("20.00 FPS")) throw new Error("Per-field FPS did not render in the source selector");
+if ((await sampleMapping.locator("[data-map-target]").inputValue()) !== "") throw new Error("Field target was populated automatically");
+const declaredFields = await page.textContent("#motionActionFields");
+if (!declaredFields.includes("joint_state/qpos + joint_state/qvel + joint_state/torque")) throw new Error("Declared state fields did not render");
+if (!declaredFields.includes("joint_action/action + eef_action/action")) throw new Error("Declared action fields did not render");
 await fpsInput.fill("10");
 await fpsInput.press("Tab");
 if (!(await page.locator("#createJobButton").isDisabled())) throw new Error("Changing target FPS did not require a rescan");
 await fpsInput.fill("20");
 await page.click("#inspectButton");
 await page.waitForSelector("#createJobButton:not([disabled])");
-await page.fill('[data-field-source="joint_state/qvel"]', "observation.velocity");
-await page.locator('[data-field-source="joint_state/qpos"]').evaluate((element) => element.scrollIntoView({ block: "center" }));
+const mappings = [
+  ["joint_state/qpos", "observation.state"],
+  ["joint_state/qpos", "observation.qpos_copy"],
+  ["joint_state/qvel", "observation.velocity"],
+  ["joint_action/action", "action"],
+  ["Cam1", "observation.images.head"],
+  ["Cam2", "observation.images.left_wrist"],
+];
+for (const [source, target] of mappings) {
+  await page.click("[data-field-map-add]");
+  const row = page.locator(".field-map-row").last();
+  await row.locator("[data-map-source]").selectOption(source);
+  await row.locator("[data-map-target]").fill(target);
+}
+if ((await page.locator('[data-map-source] option:checked').filter({ hasText: "joint_state/qpos" }).count()) !== 2) throw new Error("Duplicate raw fields were not selectable");
+await page.locator(".field-map-row").first().evaluate((element) => element.scrollIntoView({ block: "center" }));
 await page.screenshot({ path: "/tmp/lerobot-ui-desktop-fields.png" });
+await page.check("#fillZeroStateAction");
 await page.check("#trimStationaryStart");
 await page.check("#removeStationarySegments");
 await page.locator("#stationaryFrames").fill("3");
@@ -77,7 +111,7 @@ await page.waitForFunction(() => document.querySelector("#outputPreview")?.class
 if ((await page.textContent("#detailName")) !== "ui-e2e") throw new Error("Job form values changed during bootstrap");
 execFileSync(
   "/home/amin/miniconda3/envs/lerobot21/bin/python",
-  ["-c", `import pyarrow.parquet as pq; table = pq.read_table("${outputPath}/data/chunk-000/file-000.parquet"); assert "observation.velocity" in table.column_names; assert table.num_rows == 4, table.num_rows`],
+  ["-c", `import pyarrow.parquet as pq; table = pq.read_table("${outputPath}/data/chunk-000/file-000.parquet"); assert "observation.velocity" in table.column_names; assert "observation.qpos_copy" in table.column_names; assert table.num_rows == 4, table.num_rows`],
   { stdio: "inherit" },
 );
 await page.waitForTimeout(4800);
@@ -100,6 +134,8 @@ await page.screenshot({ path: "/tmp/lerobot-ui-desktop.png", fullPage: true });
 await page.setViewportSize({ width: 390, height: 844 });
 await page.evaluate(() => window.scrollTo(0, 0));
 await page.screenshot({ path: "/tmp/lerobot-ui-mobile-control.png" });
+await page.locator("#fieldMapping").scrollIntoViewIfNeeded();
+await page.screenshot({ path: "/tmp/lerobot-ui-mobile-fields.png" });
 await page.locator("#motionScanReadout").scrollIntoViewIfNeeded();
 await page.screenshot({ path: "/tmp/lerobot-ui-mobile-motion.png" });
 await page.locator("#videoCrf").scrollIntoViewIfNeeded();
@@ -112,9 +148,12 @@ if (mobileWidth.width > mobileWidth.viewport + 1) throw new Error(`Mobile body o
 const jobRow = page.locator("#jobsBody tr").filter({ hasText: "ui-e2e" });
 const jobId = await jobRow.getAttribute("data-job-id");
 const jobRecord = await (await page.request.get(`${baseURL}/api/jobs/${jobId}`)).json();
-if (jobRecord.config.field_mapping["joint_state/qvel"] !== "observation.velocity") throw new Error("Field mapping was not persisted");
+if (!Array.isArray(jobRecord.config.field_mapping)) throw new Error("Field mappings were not persisted as rows");
+if (jobRecord.config.field_mapping.filter((row) => row.source === "joint_state/qpos").length !== 2) throw new Error("Duplicate raw field mappings were not persisted");
+if (!jobRecord.config.field_mapping.some((row) => row.source === "joint_state/qvel" && row.target === "observation.velocity")) throw new Error("Field mapping was not persisted");
 if (jobRecord.config.video_crf !== 22) throw new Error("Video CRF was not persisted");
 if (jobRecord.config.cpu_limit_percent !== 95) throw new Error("CPU utilization limit was not persisted");
+if (!jobRecord.config.fill_zero_state_action) throw new Error("Zero state/action fill was not persisted");
 if (!jobRecord.config.trim_stationary_start || !jobRecord.config.remove_stationary_segments || jobRecord.config.stationary_frames !== 3) throw new Error("Motion rules were not persisted");
 if (jobRecord.removed_frames !== 12 || jobRecord.removed_segments !== 4) throw new Error("Converted motion filtering differs from pre-scan");
 await jobRow.locator('[data-job-action="delete"]').click();

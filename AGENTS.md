@@ -1,6 +1,6 @@
 # Repository Agent Instructions
 
-Last verified: 2026-07-16.
+Last verified: 2026-07-17.
 
 Before modifying any file in this repository, read
 `skills/maintain-lerobot-converter/SKILL.md` and every reference it routes for the affected area.

@@ -13,6 +13,8 @@ const state = {
   previewTimer: null,
   pollBusy: false,
   bootstrapBusy: false,
+  updateBusy: false,
+  updateStatus: null,
   lastOutputSegmentCount: -1,
 };
 
@@ -25,6 +27,19 @@ const statusLabels = {
   completed: "已完成",
   failed: "失败",
   canceled: "已取消",
+};
+
+const updateStatusLabels = {
+  checking: "正在检查远端",
+  local_changes: "本地含有修改",
+  update_available: "发现远端更新",
+  up_to_date: "代码已是最新",
+  ahead: "本地领先远端",
+  diverged: "Git 历史已分叉",
+  unavailable: "自动更新不可用",
+  error: "更新检查失败",
+  updated: "更新已拉取",
+  not_checked: "尚未检查更新",
 };
 
 function invalidateInspection() {
@@ -50,6 +65,60 @@ async function request(path, options = {}, expectBlob = false) {
   return expectBlob ? response.blob() : response.json();
 }
 
+function renderRepositoryUpdate(status) {
+  state.updateStatus = status;
+  const notice = $("#updateNotice");
+  notice.hidden = false;
+  notice.dataset.status = status.status;
+  $("#updateTitle").textContent = updateStatusLabels[status.status] || "代码更新";
+  $("#updateMessage").textContent = status.message || "--";
+  const meta = [status.branch, status.upstream];
+  if (status.local_change_count) meta.push(`${status.local_change_count} LOCAL CHANGE${status.local_change_count === 1 ? "" : "S"}`);
+  if (Number(status.ahead)) meta.push(`AHEAD ${status.ahead}`);
+  if (Number(status.behind)) meta.push(`BEHIND ${status.behind}`);
+  if (status.checked_at) meta.push(new Date(status.checked_at * 1000).toLocaleString("zh-CN", { hour12: false }));
+  const metadata = $("#updateMeta");
+  metadata.textContent = meta.filter(Boolean).join(" / ");
+  metadata.hidden = !metadata.textContent;
+  $("#updatePull").hidden = status.status !== "update_available";
+  window.lucide?.createIcons();
+}
+
+async function checkRepositoryUpdates(manual = false) {
+  if (state.updateBusy) return;
+  state.updateBusy = true;
+  renderRepositoryUpdate({ status: "checking", message: "正在检查本地状态与远端提交。" });
+  $("#updateCheck").disabled = true;
+  $("#updatePull").disabled = true;
+  try {
+    renderRepositoryUpdate(await request("/api/update/check", { method: "POST", body: { manual } }));
+  } catch (error) {
+    renderRepositoryUpdate({ status: "error", message: `无法检查远端更新：${error.message}` });
+  } finally {
+    state.updateBusy = false;
+    $("#updateCheck").disabled = false;
+    $("#updatePull").disabled = false;
+  }
+}
+
+async function pullRepositoryUpdate() {
+  if (state.updateBusy) return;
+  state.updateBusy = true;
+  $("#updateCheck").disabled = true;
+  $("#updatePull").disabled = true;
+  try {
+    const status = await request("/api/update/pull", { method: "POST", body: {} });
+    renderRepositoryUpdate(status);
+    toast(status.status === "updated" ? "UPDATED" : "UPDATE", status.message);
+  } catch (error) {
+    toast("UPDATE FAILED", error.message);
+  } finally {
+    state.updateBusy = false;
+    $("#updateCheck").disabled = false;
+    $("#updatePull").disabled = false;
+  }
+}
+
 async function bootstrap() {
   const data = await request("/api/bootstrap");
   state.bootstrap = data;
@@ -63,6 +132,7 @@ async function bootstrap() {
   updateMotionControls();
   if (state.jobs.length) selectJob(state.jobs[0].id, false);
   window.lucide?.createIcons();
+  checkRepositoryUpdates(false);
 }
 
 function renderAdapters() {
@@ -123,11 +193,16 @@ function configureResources(hardware) {
 }
 
 function declaredActionFields(descriptor) {
-  return descriptorFields(descriptor).filter((field) => field.is_action || field.default_target === "action");
+  return descriptorFields(descriptor).filter((field) => field.is_action);
+}
+
+function declaredStateFields(descriptor) {
+  return descriptorFields(descriptor).filter((field) => field.is_state);
 }
 
 function motionRules() {
   return {
+    fill_zero_state_action: $("#fillZeroStateAction").checked,
     trim_stationary_start: $("#trimStationaryStart").checked,
     remove_stationary_segments: $("#removeStationarySegments").checked,
     stationary_frames: Number($("#stationaryFrames").value),
@@ -141,10 +216,12 @@ function clearMotionScan() {
 }
 
 function configureMotionFields(descriptor) {
-  const fields = declaredActionFields(descriptor);
+  const stateFields = declaredStateFields(descriptor);
+  const actionFields = declaredActionFields(descriptor);
   const readout = $("#motionActionFields");
   readout.hidden = false;
-  readout.querySelector("strong").textContent = fields.length ? fields.map((field) => field.name).join(" + ") : "未声明";
+  readout.querySelector("[data-state-fields]").textContent = stateFields.length ? stateFields.map((field) => field.name).join(" + ") : "未声明";
+  readout.querySelector("[data-action-fields]").textContent = actionFields.length ? actionFields.map((field) => field.name).join(" + ") : "未声明";
   clearMotionScan();
   updateMotionControls();
 }
@@ -261,14 +338,13 @@ function renderDescriptor(descriptor) {
     ...fields.map((field) => field.default_target).filter(Boolean),
   ])];
   mapping.hidden = false;
-  mapping.innerHTML = `<span class="field-label">Field mapping</span>
+  mapping.innerHTML = `<div class="field-map-toolbar">
+      <span class="field-label">Field mapping</span>
+      <button class="icon-button field-map-add" type="button" data-field-map-add aria-label="添加字段映射" title="添加字段映射"><i data-lucide="plus"></i></button>
+    </div>
     <datalist id="lerobotFieldTargets">${targetSuggestions.map((target) => `<option value="${escapeHtml(target)}"></option>`).join("")}</datalist>
-    <div class="field-map-head"><span>RAW FIELD</span><span></span><span>LEROBOT FIELD</span></div>
-    ${fields.map((field) => `<div class="field-map-row">
-      <div class="field-source" title="${escapeHtml(field.name)}"><strong>${escapeHtml(field.name)}</strong><span>${field.is_image ? "IMG" : field.is_action ? "ACT" : field.dtype.toUpperCase()} / ${(field.shape || []).join("x")} / ${formatNumber(field.fps || descriptor.fps, 2)} FPS</span></div>
-      <i data-lucide="arrow-right"></i>
-      <input type="text" data-field-source="${escapeHtml(field.name)}" list="lerobotFieldTargets" value="${escapeHtml(field.default_target || "")}" placeholder="IGNORE" aria-label="${escapeHtml(field.name)} LeRobot 目标字段">
-    </div>`).join("")}
+    <div class="field-map-head"><span>RAW FIELD</span><span></span><span>LEROBOT FIELD</span><span></span></div>
+    <div class="field-map-rows" id="fieldMappingRows"><p class="field-map-empty">暂无字段映射</p></div>
     <label class="field-label" for="stateNames">observation.state names override</label>
     <textarea id="stateNames" rows="2" placeholder="state_0, state_1, ..."></textarea>
     <label class="field-label" for="actionNames">action names override</label>
@@ -276,17 +352,64 @@ function renderDescriptor(descriptor) {
   window.lucide?.createIcons();
 }
 
+function fieldSummary(field) {
+  const roles = [field.is_state && "STATE", field.is_action && "ACTION", field.is_image && "IMG"].filter(Boolean);
+  const kind = roles.length ? roles.join("+") : "DATA";
+  return `${kind} / ${field.dtype.toUpperCase()} / ${(field.shape || []).join("x")} / ${formatNumber(field.fps || state.descriptor?.fps, 2)} FPS`;
+}
+
+function addFieldMappingRow(source = "", target = "") {
+  if (!state.descriptor) return;
+  const fields = descriptorFields(state.descriptor);
+  const row = document.createElement("div");
+  row.className = "field-map-row";
+  row.innerHTML = `<div class="field-map-source">
+      <select data-map-source required aria-label="原始数据字段">
+        <option value="">选择原始字段</option>
+        ${fields.map((field) => `<option value="${escapeHtml(field.name)}">${escapeHtml(field.name)}</option>`).join("")}
+      </select>
+      <span data-map-meta>--</span>
+    </div>
+    <i data-lucide="arrow-right" aria-hidden="true"></i>
+    <input type="text" data-map-target list="lerobotFieldTargets" required placeholder="observation..." aria-label="LeRobot 目标字段">
+    <button class="icon-button field-map-remove" type="button" data-field-map-remove aria-label="删除字段映射" title="删除字段映射"><i data-lucide="x"></i></button>`;
+  row.querySelector("[data-map-source]").value = source;
+  row.querySelector("[data-map-target]").value = target;
+  $("#fieldMappingRows").append(row);
+  updateFieldMappingRow(row);
+  window.lucide?.createIcons();
+}
+
+function updateFieldMappingRow(row) {
+  const source = row.querySelector("[data-map-source]").value;
+  const field = descriptorFields(state.descriptor).find((item) => item.name === source);
+  row.querySelector("[data-map-meta]").textContent = field ? `${field.name} / ${fieldSummary(field)}` : "--";
+}
+
+function collectFieldMappings() {
+  const rows = $$(".field-map-row", $("#fieldMappingRows")).map((row) => ({
+    source: row.querySelector("[data-map-source]").value.trim(),
+    target: row.querySelector("[data-map-target]").value.trim(),
+  }));
+  if (!rows.length) throw new Error("请至少添加一条字段映射");
+  if (rows.some((row) => !row.source || !row.target)) throw new Error("每条字段映射都必须选择源字段并填写目标字段");
+  const targets = rows.map((row) => row.target);
+  if (new Set(targets).size !== targets.length) throw new Error("LeRobot 目标字段不能重复");
+  return rows;
+}
+
+function configFieldMappingRows(mapping) {
+  if (Array.isArray(mapping)) return mapping;
+  return Object.entries(mapping || {}).map(([source, target]) => ({ source, target }));
+}
+
 async function createJob(event) {
   event.preventDefault();
   if (!state.descriptor) return toast("SOURCE", "请先扫描原始数据");
+  const fieldMapping = collectFieldMappings();
   const button = $("#createJobButton");
   button.disabled = true;
   try {
-    const fieldMapping = {};
-    $$('[data-field-source]').forEach((input) => {
-      const target = input.value.trim();
-      if (target) fieldMapping[input.dataset.fieldSource] = target;
-    });
     const payload = {
       adapter: $("#adapterSelect").value,
       source_path: $("#sourcePath").value,
@@ -456,7 +579,10 @@ function configurePreview(descriptor, job) {
   const camera = $("#previewCamera");
   const previous = camera.value;
   let cameras = descriptorFields(descriptor).filter((field) => field.is_image).map((field) => field.name);
-  if (job?.config?.field_mapping) cameras = cameras.filter((name) => job.config.field_mapping[name]);
+  if (job?.config?.field_mapping) {
+    const mappedSources = new Set(configFieldMappingRows(job.config.field_mapping).map((row) => row.source));
+    cameras = cameras.filter((name) => mappedSources.has(name));
+  }
   $("#previewBand").hidden = cameras.length === 0;
   camera.replaceChildren(...cameras.map((name) => new Option(name, name)));
   if (!cameras.length) return;
@@ -612,6 +738,7 @@ function savePreferences() {
     memory_gb: $("#memoryGb").value,
     segment_size: $("#segmentSize").value,
     video_crf: $("#videoCrf").value,
+    fill_zero_state_action: $("#fillZeroStateAction").checked,
     trim_stationary_start: $("#trimStationaryStart").checked,
     remove_stationary_segments: $("#removeStationarySegments").checked,
     stationary_frames: $("#stationaryFrames").value,
@@ -636,7 +763,7 @@ function splitNames(value = "") { return value.split(/[,\n]/).map((item) => item
 function descriptorFields(descriptor) {
   if (descriptor?.fields?.length) return descriptor.fields;
   return [
-    { name: "state", shape: [descriptor.state_dim], dtype: "float32", is_image: false, default_target: "observation.state", fps: descriptor.fps },
+    { name: "state", shape: [descriptor.state_dim], dtype: "float32", is_image: false, is_state: true, default_target: "observation.state", fps: descriptor.fps },
     { name: "action", shape: [descriptor.action_dim], dtype: "float32", is_image: false, is_action: true, default_target: "action", fps: descriptor.fps },
     ...descriptor.cameras.map((camera) => ({
       name: camera,
@@ -727,9 +854,20 @@ function bindEvents() {
   $("#resumePathButton").addEventListener("click", () => resumeFromPath().catch((error) => toast("RECOVERY FAILED", error.message)));
   $("#refreshButton").addEventListener("click", () => state.bootstrap ? refreshJobs() : initializeBackend(true));
   $("#backendRetry").addEventListener("click", () => checkBackend());
+  $("#updateCheck").addEventListener("click", () => checkRepositoryUpdates(true));
+  $("#updatePull").addEventListener("click", () => pullRepositoryUpdate());
   $("#jobsBody").addEventListener("click", (event) => handleJobAction(event).catch((error) => toast("TASK", error.message)));
+  $("#fieldMapping").addEventListener("click", (event) => {
+    if (event.target.closest("[data-field-map-add]")) addFieldMappingRow();
+    const remove = event.target.closest("[data-field-map-remove]");
+    if (remove) remove.closest(".field-map-row").remove();
+  });
+  $("#fieldMapping").addEventListener("change", (event) => {
+    const source = event.target.closest("[data-map-source]");
+    if (source) updateFieldMappingRow(source.closest(".field-map-row"));
+  });
   ["#cpuCores", "#cpuLimitPercent", "#memoryGb", "#segmentSize", "#videoCrf"].forEach((selector) => $(selector).addEventListener("input", updateResourceOutputs));
-  ["#trimStationaryStart", "#removeStationarySegments"].forEach((selector) => $(selector).addEventListener("change", () => { clearMotionScan(); updateMotionControls(); }));
+  ["#fillZeroStateAction", "#trimStationaryStart", "#removeStationarySegments"].forEach((selector) => $(selector).addEventListener("change", () => { clearMotionScan(); updateMotionControls(); }));
   $("#stationaryFrames").addEventListener("input", () => { clearMotionScan(); updateMotionControls(); });
   $$('[data-browse]').forEach((button) => button.addEventListener("click", () => openPicker(button.dataset.browse).catch((error) => toast("PATH", error.message))));
   $("#directoryUp").addEventListener("click", async () => renderDirectory(await request(`/api/fs?path=${encodeURIComponent($("#directoryUp").dataset.path)}`)));

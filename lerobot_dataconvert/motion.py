@@ -1,11 +1,30 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
 
 from .models import DatasetDescriptor, EpisodeRef
+
+
+def forward_fill_zero_fields(
+    frame_values: Mapping[str, Any],
+    field_names: Sequence[str],
+    previous_values: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    missing = [name for name in field_names if name not in frame_values]
+    if missing:
+        raise ValueError(f"Missing declared state/action fields: {', '.join(missing)}")
+
+    filled = dict(frame_values)
+    for name in field_names:
+        current = np.asarray(frame_values[name])
+        if name in previous_values and np.all(current == 0):
+            filled[name] = previous_values[name].copy()
+        else:
+            previous_values[name] = current.copy()
+    return filled
 
 
 def analyze_action_sequence(
@@ -15,6 +34,7 @@ def analyze_action_sequence(
     trim_stationary_start: bool,
     remove_stationary_segments: bool,
     stationary_frames: int,
+    fill_zero_state_action: bool = False,
 ) -> dict[str, Any]:
     if not action_fields:
         raise ValueError("The raw dataset adapter did not declare any action fields")
@@ -23,10 +43,15 @@ def analyze_action_sequence(
     previous: tuple[np.ndarray, ...] | None = None
     run_start = 0
     frame_count = 0
+    previous_values: dict[str, np.ndarray] = {}
     for frame_count, frame_values in enumerate(values, start=1):
         missing = [name for name in action_fields if name not in frame_values]
         if missing:
             raise ValueError(f"Missing declared action fields: {', '.join(missing)}")
+        if fill_zero_state_action:
+            frame_values = forward_fill_zero_fields(
+                frame_values, action_fields, previous_values
+            )
         current = tuple(np.asarray(frame_values[name]).copy() for name in action_fields)
         if previous is None:
             previous = current
@@ -78,6 +103,7 @@ def analyze_episode_motion(
     trim_stationary_start: bool,
     remove_stationary_segments: bool,
     stationary_frames: int,
+    fill_zero_state_action: bool = False,
 ) -> dict[str, Any]:
     action_fields = [field.name for field in descriptor.resolved_action_fields()]
     return analyze_action_sequence(
@@ -87,6 +113,7 @@ def analyze_episode_motion(
         trim_stationary_start,
         remove_stationary_segments,
         stationary_frames,
+        fill_zero_state_action,
     )
 
 
@@ -96,6 +123,7 @@ def scan_dataset_motion(
     trim_stationary_start: bool,
     remove_stationary_segments: bool,
     stationary_frames: int,
+    fill_zero_state_action: bool = False,
 ) -> dict[str, Any]:
     action_fields = [field.name for field in descriptor.resolved_action_fields()]
     if not action_fields:
@@ -118,6 +146,7 @@ def scan_dataset_motion(
             trim_stationary_start,
             remove_stationary_segments,
             stationary_frames,
+            fill_zero_state_action,
         )
         totals["source_frames"] += int(result["source_frames"])
         totals["kept_frames"] += int(result["kept_frames"])

@@ -1,6 +1,6 @@
 # Dataset Contracts
 
-Last verified: 2026-07-16.
+Last verified: 2026-07-17.
 
 Apply the freshness contract in `../SKILL.md`: update this file in the same change whenever the
 implementation makes a statement below inaccurate.
@@ -18,17 +18,22 @@ be read without decoding images. Register built-ins with `@register_adapter`; ex
 `LEROBOT_DATACONVERT_PLUGINS` or the `lerobot_dataconvert.adapters` entry-point group.
 
 `DatasetDescriptor.fields` is the source of truth. Each `RawField` declares name, shape, dtype,
-image status, default target, component names, action status, and native FPS. `FrameSample.fields`
-must contain the same source names. Legacy `state`, `action`, and camera members remain compatibility
-fallbacks.
+independent `is_state`, `is_action`, and `is_image` properties, default target, component names, and
+native FPS. A dataset may declare any number of state or action fields; do not infer either property
+from the field name or destination mapping. `FrameSample.fields` must contain the same source names.
+Legacy `state`, `action`, and camera members remain compatibility fallbacks.
 
 ## Field Mapping And Names
 
-- Mapping changes destination feature names, not source values or ordering.
-- Target names must be unique, valid, and not reserved LeRobot fields.
+- Mapping is an ordered list of `{source, target}` rows. It changes destination feature names, not
+  source values.
+- A source field may appear in multiple rows so the same raw value can feed different features.
+- Target names must be unique across rows, valid, and not reserved LeRobot fields.
 - Images cannot map to numeric state/action fields; numeric values cannot map under
   `observation.images.*`.
-- Leaving a target blank ignores that source field.
+- Omit an unmapped source instead of adding an incomplete row. Every persisted row has both names.
+- Legacy source-to-target objects must remain readable and normalize to ordered rows during
+  `JobConfig` deserialization.
 - `observation.state names override` and `action names override` affect component metadata only.
   They do not reorder, select, or transform data. When the supplied count differs from the feature
   dimension, the converter falls back to generated `state_N` or `action_N` names.
@@ -63,6 +68,15 @@ Independent streams may have different counts and non-contiguous frame indices. 
 old assumption that PKL and camera filenames must share one frame index or filename.
 
 ## Motion Filtering
+
+Optional strict-zero repair runs before motion analysis and converted-frame filtering. For every
+field with `is_state=True` or `is_action=True`, it replaces the whole field only when every element
+is exactly equal to zero. Replacement uses that field's effective value from the preceding raw frame
+in the same episode, so consecutive zero fields forward-fill from the last available value. The first
+frame has no predecessor and remains unchanged; values never cross episode boundaries. Partial-zero
+vectors, images without a state/action property, and numeric fields with neither property are not
+changed. Action pre-scan applies the same rule to every declared action field, including unmapped
+ones.
 
 Action equality currently uses exact `numpy.array_equal` across all declared action fields. The
 "continuous stationary threshold" is a frame-count threshold, not a numeric movement tolerance.

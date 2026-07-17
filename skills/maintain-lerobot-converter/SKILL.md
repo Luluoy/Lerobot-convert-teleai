@@ -5,7 +5,7 @@ description: Safely maintain the LeRobot Data Convert repository. Use for any ch
 
 # Maintain LeRobot Converter
 
-Last verified: 2026-07-16.
+Last verified: 2026-07-17.
 
 ## Freshness Contract
 
@@ -42,10 +42,14 @@ obsolete claims instead of leaving contradictory guidance.
 - Never load TeleAxis pickle data from an untrusted source.
 - Keep inspect, preview, motion pre-scan, and conversion on the same selected FPS and aligned frame
   timeline.
+- Keep optional strict-zero repair field-based and episode-local. It must use every adapter-declared
+  state/action field and run before both action analysis and converted-frame filtering.
 - Keep trajectory task lists disjoint and exhaustive; workers must not compete for episodes.
 - Preserve completed segments during stop/recovery and accept a segment only after its atomic
   completion marker exists.
 - Treat task-list deletion as metadata-only by default. Do not delete source, output, or cache files
   unless the caller explicitly requests the separate cache-removal behavior.
+- Repository updates must stop on any local change, persist that pause until a manual check, and use
+  fast-forward-only pull. Never add automatic stash, reset, checkout, merge, or conflict resolution.
 - Bump the service-worker cache key when changing cached shell assets.
 - Do not commit or push until the requested verification passes.

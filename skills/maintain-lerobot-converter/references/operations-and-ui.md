@@ -1,6 +1,6 @@
 # Operations And UI
 
-Last verified: 2026-07-16.
+Last verified: 2026-07-17.
 
 Apply the freshness contract in `../SKILL.md`: update this file in the same change whenever the
 implementation makes a statement below inaccurate.
@@ -13,6 +13,8 @@ implementation makes a statement below inaccurate.
 - Default bind address: `127.0.0.1:8765`.
 - Runtime state defaults to `~/.local/share/lerobot-dataconvert` and can be overridden with
   `LEROBOT_DATACONVERT_STATE` or `--state-dir`.
+- Repository update checks use the checkout containing the package;
+  `LEROBOT_DATACONVERT_REPO` may explicitly select another checkout.
 - Package initialization defaults `ARROW_DEFAULT_MEMORY_POOL` to `system`. PyArrow 25's mimalloc
   backend can segfault after repeated v3 preview reads on short-lived HTTP threads; preserve this
   default unless the allocator and repeated-preview E2E have been verified together.
@@ -48,6 +50,27 @@ cards.
 Keep desktop and 390 px mobile layouts free of horizontal body overflow, text overlap, and control
 resizing. The table may own an internal horizontal scroller. When changing cached shell assets,
 bump the cache key in `static/sw.js` so installed PWAs receive the update.
+
+After inspection, the field-mapping editor starts with no rows. Its add action creates one row with
+a selectable raw source and an editable LeRobot target; the source selector exposes the adapter's
+type, shape, and FPS metadata. Rows are independently removable, raw sources may repeat, and the UI
+must reject duplicate targets before submission. Backend validation remains authoritative.
+
+The data-cleaning section lists every adapter-declared state and action field separately. Its
+strict-zero forward-fill option remains selectable before and after inspection; the backend validates
+that the inspected adapter declared at least one state/action field. The setting is optional,
+persisted with the job, and included in motion pre-scan requests.
+
+## Repository Update UX
+
+After bootstrap, start the remote check asynchronously so task controls are not blocked. Show a
+full-width Git status band with real branch/upstream/ahead/behind data and a manual check command.
+Only `update_available` exposes the pull command. Local changes must show that automatic updates are
+paused, recommend technical help or asking an Agent, and keep manual check available. After a pull,
+tell the user to ask an Agent to check dependencies through `INSTALL.md` and restart the service.
+
+Do not hide update errors or imply that fetch, pull, dependency installation, and service restart are
+the same operation. Keep the status band usable at 390 px without body overflow.
 
 The delete task action is available only when a job is not active. It calls metadata-only DELETE,
 removes the row/detail selection, and explicitly tells the user that local files were retained.

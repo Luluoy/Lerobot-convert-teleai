@@ -4,6 +4,27 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
+def normalize_field_mapping_rows(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        value = [{"source": source, "target": target} for source, target in value.items()]
+    if not isinstance(value, list):
+        raise TypeError("field_mapping must be a list of rows")
+
+    rows: list[dict[str, str]] = []
+    for row in value:
+        if not isinstance(row, dict):
+            raise TypeError("each field_mapping row must be an object")
+        rows.append(
+            {
+                "source": str(row.get("source") or "").strip(),
+                "target": str(row.get("target") or "").strip(),
+            }
+        )
+    return rows
+
+
 @dataclass(frozen=True)
 class EpisodeRef:
     key: str
@@ -30,6 +51,7 @@ class RawField:
     names: tuple[str, ...] = ()
     is_action: bool = False
     fps: float = 0.0
+    is_state: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -72,7 +94,13 @@ class DatasetDescriptor:
         if self.fields:
             return list(self.fields)
         fields = [
-            RawField("state", (self.state_dim,), default_target="observation.state", fps=self.fps),
+            RawField(
+                "state",
+                (self.state_dim,),
+                default_target="observation.state",
+                is_state=True,
+                fps=self.fps,
+            ),
             RawField("action", (self.action_dim,), default_target="action", is_action=True, fps=self.fps),
         ]
         fields.extend(
@@ -89,10 +117,11 @@ class DatasetDescriptor:
         return fields
 
     def resolved_action_fields(self) -> list[RawField]:
+        return [field for field in self.resolved_fields() if field.is_action]
+
+    def resolved_state_action_fields(self) -> list[RawField]:
         return [
-            field
-            for field in self.resolved_fields()
-            if field.is_action or field.default_target == "action"
+            field for field in self.resolved_fields() if field.is_state or field.is_action
         ]
 
     @property
@@ -150,17 +179,20 @@ class JobConfig:
     action_names: list[str]
     video_crf: int = 30
     cpu_limit_percent: int = 95
-    field_mapping: dict[str, str] = field(default_factory=dict)
+    field_mapping: list[dict[str, str]] = field(default_factory=list)
     adapter_options: dict[str, Any] = field(default_factory=dict)
     trim_stationary_start: bool = False
     remove_stationary_segments: bool = False
     stationary_frames: int = 20
-    skip_zero_state: bool = True
+    skip_zero_state: bool = False
     overwrite: bool = False
+    fill_zero_state_action: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "JobConfig":
+        value = dict(value)
+        value["field_mapping"] = normalize_field_mapping_rows(value.get("field_mapping"))
         return cls(**value)

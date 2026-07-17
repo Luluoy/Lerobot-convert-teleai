@@ -105,6 +105,24 @@ class ConversionTest(unittest.TestCase):
         )
         self.assertEqual(result["kept_frames"], 2)
 
+    def test_motion_analysis_forward_fills_each_zero_action_field(self) -> None:
+        values = [
+            {"joint": [1], "eef": [2]},
+            {"joint": [0], "eef": [2]},
+            {"joint": [0], "eef": [0]},
+            {"joint": [3], "eef": [2]},
+        ]
+        without_fill = analyze_action_sequence(values, ["joint", "eef"], 4, False, True, 2)
+        with_fill = analyze_action_sequence(
+            values, ["joint", "eef"], 4, False, True, 2, True
+        )
+        self.assertEqual(without_fill["removed_frames"], 0)
+        self.assertEqual(with_fill["removed_frames"], 2)
+        self.assertEqual(
+            with_fill["segments"],
+            [{"start": 1, "end": 3, "kind": "stationary", "frames": 2}],
+        )
+
     def test_video_crf_is_forwarded_to_lerobot_encoder(self) -> None:
         with tempfile.TemporaryDirectory(prefix="lerobot-video-crf-test-") as temporary:
             root = Path(temporary)
@@ -115,8 +133,15 @@ class ConversionTest(unittest.TestCase):
             legacy_config = config.to_dict()
             legacy_config.pop("video_crf")
             legacy_config.pop("cpu_limit_percent")
+            legacy_config.pop("fill_zero_state_action")
+            legacy_config["field_mapping"] = {"state": "observation.state"}
             self.assertEqual(JobConfig.from_dict(legacy_config).video_crf, 30)
             self.assertEqual(JobConfig.from_dict(legacy_config).cpu_limit_percent, 95)
+            self.assertFalse(JobConfig.from_dict(legacy_config).fill_zero_state_action)
+            self.assertEqual(
+                JobConfig.from_dict(legacy_config).field_mapping,
+                [{"source": "state", "target": "observation.state"}],
+            )
 
             try:
                 from lerobot.datasets import lerobot_dataset as dataset_module

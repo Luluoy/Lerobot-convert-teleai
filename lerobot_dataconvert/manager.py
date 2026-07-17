@@ -24,7 +24,7 @@ from .conversion import (
     run_finalize_worker,
     run_segment_worker,
 )
-from .models import DatasetDescriptor, JobConfig
+from .models import DatasetDescriptor, JobConfig, normalize_field_mapping_rows
 from .motion import scan_dataset_motion
 
 
@@ -179,6 +179,7 @@ class JobManager:
             trim_start,
             remove_segments,
             stationary_frames,
+            bool(payload.get("fill_zero_state_action", False)),
         )
 
     def create_job(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -362,6 +363,9 @@ class JobManager:
         trim_start, remove_segments, stationary_frames = _normalize_motion_rules(payload)
         if (trim_start or remove_segments) and not descriptor.resolved_action_fields():
             raise ValueError("The raw dataset adapter did not declare any action fields")
+        fill_zero_state_action = bool(payload.get("fill_zero_state_action", False))
+        if fill_zero_state_action and not descriptor.resolved_state_action_fields():
+            raise ValueError("The raw dataset adapter did not declare any state/action fields")
         return JobConfig(
             adapter=payload["adapter"],
             source_path=source_path,
@@ -387,6 +391,7 @@ class JobManager:
             trim_stationary_start=trim_start,
             remove_stationary_segments=remove_segments,
             stationary_frames=stationary_frames,
+            fill_zero_state_action=fill_zero_state_action,
             skip_zero_state=False,
             overwrite=bool(payload.get("overwrite", False)),
         )
@@ -979,26 +984,35 @@ def _normalize_motion_rules(payload: dict[str, Any]) -> tuple[bool, bool, int]:
 
 def _normalize_field_mapping(
     payload: dict[str, Any], descriptor: DatasetDescriptor, camera_names: dict[str, str]
-) -> dict[str, str]:
+) -> list[dict[str, str]]:
     fields = {field.name: field for field in descriptor.resolved_fields()}
     requested = payload.get("field_mapping") if "field_mapping" in payload else None
-    if requested is not None and not isinstance(requested, dict):
-        raise TypeError("field_mapping must be an object")
-    unknown = set(requested or {}) - set(fields)
-    if unknown:
-        raise ValueError(f"Unknown raw fields: {', '.join(sorted(unknown))}")
-
-    mapping: dict[str, str] = {}
-    for name, field in fields.items():
-        if requested is None:
+    if requested is None:
+        rows = []
+        for name, field in fields.items():
             target = field.default_target
             if field.is_image and name in camera_names and payload.get("camera_names") is not None:
                 target = f"observation.images.{camera_names[name]}"
-        else:
-            target = requested.get(name, "")
-        target = str(target or "").strip()
-        if not target:
-            continue
+            if target:
+                rows.append({"source": name, "target": target})
+    else:
+        legacy_mapping = isinstance(requested, dict)
+        rows = normalize_field_mapping_rows(requested)
+        if legacy_mapping:
+            rows = [row for row in rows if row["target"]]
+
+    if not rows:
+        raise ValueError("At least one raw field must be mapped")
+    if any(not row["source"] or not row["target"] for row in rows):
+        raise ValueError("Each field mapping row requires a source and target")
+    unknown = {row["source"] for row in rows if row["source"] not in fields}
+    if unknown:
+        raise ValueError(f"Unknown raw fields: {', '.join(sorted(unknown))}")
+
+    for row in rows:
+        name = row["source"]
+        target = row["target"]
+        field = fields[name]
         if target in RESERVED_FEATURES:
             raise ValueError(f"LeRobot field is reserved: {target}")
         if FEATURE_NAME_RE.fullmatch(target) is None or "/" in target:
@@ -1007,14 +1021,11 @@ def _normalize_field_mapping(
             raise ValueError(f"Image field {name} cannot map to {target}")
         if not field.is_image and target.startswith("observation.images."):
             raise ValueError(f"Numeric field {name} cannot map to an image target")
-        mapping[name] = target
 
-    targets = list(mapping.values())
-    if not targets:
-        raise ValueError("At least one raw field must be mapped")
+    targets = [row["target"] for row in rows]
     if len(set(targets)) != len(targets):
         raise ValueError("LeRobot target fields must be unique")
-    return mapping
+    return rows
 
 
 def _safe_repo_id(value: str) -> str:

@@ -21,8 +21,8 @@ import cv2
 import numpy as np
 
 from .adapters import create_adapter
-from .models import DatasetDescriptor, EpisodeRef, JobConfig
-from .motion import analyze_episode_motion
+from .models import DatasetDescriptor, EpisodeRef, JobConfig, normalize_field_mapping_rows
+from .motion import analyze_episode_motion, forward_fill_zero_fields
 
 
 SUPPORTED_REVISIONS = (
@@ -37,30 +37,35 @@ def revision_catalog() -> list[dict[str, str]]:
 
 def camera_feature_map(config: JobConfig, descriptor: DatasetDescriptor) -> dict[str, str]:
     fields = {field.name: field for field in descriptor.resolved_fields()}
-    return {
-        source: target
-        for source, target in resolved_field_mapping(config, descriptor).items()
-        if fields[source].is_image
-    }
-
-
-def resolved_field_mapping(config: JobConfig, descriptor: DatasetDescriptor) -> dict[str, str]:
-    if config.field_mapping:
-        return dict(config.field_mapping)
     mapping: dict[str, str] = {}
+    for source, target in resolved_field_mapping(config, descriptor):
+        if fields[source].is_image:
+            mapping.setdefault(source, target)
+    return mapping
+
+
+def resolved_field_mapping(
+    config: JobConfig, descriptor: DatasetDescriptor
+) -> list[tuple[str, str]]:
+    if config.field_mapping:
+        return [
+            (row["source"], row["target"])
+            for row in normalize_field_mapping_rows(config.field_mapping)
+        ]
+    mapping: list[tuple[str, str]] = []
     for field in descriptor.resolved_fields():
         target = field.default_target
         if field.is_image and field.name in config.camera_names:
             target = f"observation.images.{config.camera_names[field.name]}"
         if target:
-            mapping[field.name] = target
+            mapping.append((field.name, target))
     return mapping
 
 
 def make_features(config: JobConfig, descriptor: DatasetDescriptor) -> dict[str, dict[str, Any]]:
     features: dict[str, dict[str, Any]] = {}
     fields = {field.name: field for field in descriptor.resolved_fields()}
-    for source, target in resolved_field_mapping(config, descriptor).items():
+    for source, target in resolved_field_mapping(config, descriptor):
         field = fields[source]
         if field.is_image:
             features[target] = {
@@ -121,8 +126,9 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
 
         field_map = resolved_field_mapping(config, descriptor)
         field_definitions = {field.name: field for field in descriptor.resolved_fields()}
+        repair_fields = [field.name for field in descriptor.resolved_state_action_fields()]
         state_source = next(
-            (source for source, target in field_map.items() if target == "observation.state"),
+            (source for source, target in field_map if target == "observation.state"),
             None,
         )
         total_frames = 0
@@ -133,6 +139,7 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
         try:
             for local_episode_index, (source_index, episode) in enumerate(zip(source_indices, episodes, strict=True)):
                 episode_frames = 0
+                previous_repair_values: dict[str, np.ndarray] = {}
                 motion_result = None
                 if config.trim_stationary_start or config.remove_stationary_segments:
                     motion_result = analyze_episode_motion(
@@ -142,6 +149,7 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
                         config.trim_stationary_start,
                         config.remove_stationary_segments,
                         config.stationary_frames,
+                        config.fill_zero_state_action,
                     )
                     removed_segments += len(motion_result["segments"])
                 drop_ranges = motion_result["segments"] if motion_result else []
@@ -160,6 +168,11 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
                                 "episode": source_index,
                             }
                         )
+                    values = sample.as_fields()
+                    if config.fill_zero_state_action:
+                        values = forward_fill_zero_fields(
+                            values, repair_fields, previous_repair_values
+                        )
                     while drop_index < len(drop_ranges) and frame_index >= drop_ranges[drop_index]["end"]:
                         drop_index += 1
                     if (
@@ -168,18 +181,18 @@ def run_segment_worker(payload: dict[str, Any], result_queue: Any) -> None:
                     ):
                         continue
 
-                    values = sample.as_fields()
                     if state_source is not None and state_source not in values:
                         raise ValueError(f"Missing mapped field {state_source} in {episode.path}")
                     if (
                         config.skip_zero_state
+                        and not config.fill_zero_state_action
                         and state_source is not None
                         and np.all(np.asarray(values[state_source]) == 0)
                     ):
                         continue
 
                     frame: dict[str, Any] = {}
-                    for source, target in field_map.items():
+                    for source, target in field_map:
                         if source not in values:
                             raise ValueError(f"Missing mapped field {source} in {episode.path}")
                         field = field_definitions[source]

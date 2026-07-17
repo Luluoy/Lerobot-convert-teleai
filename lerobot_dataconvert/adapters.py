@@ -205,7 +205,13 @@ class HDF5JointAdapter(RawDatasetAdapter):
         memory_mb = max(768, min(4096, int(640 + pixels * 10 / (1024 * 1024))))
         fps = int(self.options.get("fps", 20))
         fields = [
-            RawField("state", (state_dim,), default_target="observation.state", fps=fps),
+            RawField(
+                "state",
+                (state_dim,),
+                default_target="observation.state",
+                is_state=True,
+                fps=fps,
+            ),
             RawField("action", (action_dim,), default_target="action", is_action=True, fps=fps),
         ]
         fields.extend(
@@ -614,10 +620,23 @@ class MultiProcessingPoolDatasetAdapter(RawDatasetAdapter):
                 (len(state_names),),
                 default_target="observation.state",
                 names=state_names,
+                is_state=True,
                 fps=state_fps,
             ),
-            RawField("joint_state/qvel", (len(state_names),), names=state_names, fps=state_fps),
-            RawField("joint_state/torque", (len(state_names),), names=state_names, fps=state_fps),
+            RawField(
+                "joint_state/qvel",
+                (len(state_names),),
+                names=state_names,
+                is_state=True,
+                fps=state_fps,
+            ),
+            RawField(
+                "joint_state/torque",
+                (len(state_names),),
+                names=state_names,
+                is_state=True,
+                fps=state_fps,
+            ),
             RawField(
                 "joint_action/action",
                 (len(action_names),),
